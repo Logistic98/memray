@@ -4,6 +4,8 @@ import {
   filterChildThreads,
   sumAllocations,
   filterUninteresting,
+  filterImportSystem,
+  filterMergeNodesInverted,
 } from "./common";
 
 test("handlesSmallValues", () => {
@@ -20,7 +22,7 @@ describe("Flame graph tooltip generation", () => {
       thread_id: "merged thread",
     };
     expect(makeTooltipString(data, "1KiB", true)).toBe(
-      "File foo.py, line 10 in foo<br>1KiB total<br>3 allocations"
+      "File foo.py, line 10 in foo<br>1KiB total<br>3 allocations",
     );
   });
 
@@ -31,7 +33,7 @@ describe("Flame graph tooltip generation", () => {
       thread_id: "0x1",
     };
     expect(makeTooltipString(data, "1KiB", false)).toBe(
-      "File foo.py, line 10 in foo<br>1KiB total<br>3 allocations<br>Thread ID: 0x1"
+      "File foo.py, line 10 in foo<br>1KiB total<br>3 allocations<br>Thread ID: 0x1",
     );
   });
   test("Generate label with single allocation", () => {
@@ -41,7 +43,7 @@ describe("Flame graph tooltip generation", () => {
       thread_id: "0x1",
     };
     expect(makeTooltipString(data, "1KiB", false)).toBe(
-      "File foo.py, line 10 in foo<br>1KiB total<br>1 allocation<br>Thread ID: 0x1"
+      "File foo.py, line 10 in foo<br>1KiB total<br>1 allocation<br>Thread ID: 0x1",
     );
   });
 });
@@ -112,8 +114,8 @@ describe("Filter threads", () => {
           thread_id: "0x0",
           children: [],
         },
-        2
-      )
+        2,
+      ),
     ).toStrictEqual({
       thread_id: "0x0",
       children: [],
@@ -330,6 +332,182 @@ describe("Filter uninteresting frames", () => {
     };
     let copied_data = JSON.parse(JSON.stringify(data));
     filterUninteresting(copied_data);
+    expect(copied_data).toStrictEqual(data);
+  });
+});
+
+describe("Filter import frames", () => {
+  const data = {
+    import_system: false,
+    n_allocations: 10,
+    value: 100,
+    children: [
+      {
+        import_system: false,
+        n_allocations: 5,
+        value: 50,
+        children: [
+          {
+            import_system: true,
+            n_allocations: 2,
+            value: 20,
+            children: [
+              {
+                import_system: true,
+                n_allocations: 1,
+                value: 10,
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+      {
+        import_system: false,
+        n_allocations: 1,
+        value: 10,
+        children: [],
+      },
+    ],
+  };
+
+  test("Filter import system", () => {
+    const result = filterImportSystem(data);
+    expect(result).toStrictEqual({
+      import_system: false,
+      n_allocations: 10,
+      value: 100,
+      children: [
+        {
+          import_system: false,
+          n_allocations: 5,
+          value: 50,
+          children: [],
+        },
+        {
+          import_system: false,
+          n_allocations: 1,
+          value: 10,
+          children: [],
+        },
+      ],
+    });
+  });
+  test("Filter import system when everything is import system except root", () => {
+    const data = {
+      import_system: false,
+      n_allocations: 10,
+      value: 100,
+      children: [
+        {
+          import_system: true,
+          n_allocations: 5,
+          value: 50,
+          children: [
+            {
+              import_system: true,
+              n_allocations: 2,
+              value: 20,
+              children: [
+                {
+                  import_system: true,
+                  n_allocations: 1,
+                  value: 10,
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          import_system: true,
+          n_allocations: 1,
+          value: 10,
+          children: [],
+        },
+      ],
+    };
+    const result = filterImportSystem(data);
+    expect(result).toStrictEqual({
+      children: [],
+      import_system: false,
+      n_allocations: 10,
+      value: 100,
+    });
+  });
+
+  test("Filter import system in a deep tree", () => {
+    const result = filterImportSystem({
+      import_system: false,
+      n_allocations: 10,
+      value: 100,
+      children: [
+        {
+          import_system: true,
+          n_allocations: 5,
+          value: 50,
+          children: [
+            {
+              import_system: true,
+              n_allocations: 2,
+              value: 20,
+              children: [
+                {
+                  import_system: true,
+                  n_allocations: 1,
+                  value: 10,
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          import_system: true,
+          n_allocations: 1,
+          value: 10,
+          children: [],
+        },
+      ],
+    });
+
+    expect(result).toStrictEqual({
+      import_system: false,
+      n_allocations: 10,
+      value: 100,
+      children: [],
+    });
+  });
+  test("Filter import system doesn't modify data", () => {
+    let data = {
+      import_system: false,
+      n_allocations: 10,
+      value: 100,
+      children: [
+        {
+          import_system: false,
+          n_allocations: 5,
+          value: 50,
+          children: [
+            {
+              import_system: true,
+              n_allocations: 2,
+              value: 20,
+              children: [
+                {
+                  import_system: true,
+                  n_allocations: 1,
+                  value: 10,
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    let copied_data = JSON.parse(JSON.stringify(data));
+    filterImportSystem(copied_data);
     expect(copied_data).toStrictEqual(data);
   });
 });

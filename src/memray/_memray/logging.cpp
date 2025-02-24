@@ -1,6 +1,5 @@
 #include <iostream>
 #include <stdexcept>
-#include <string>
 
 #include "logging.h"
 
@@ -23,6 +22,12 @@ void
 setLogThreshold(int threshold)
 {
     LOG_THRESHOLD = threshold;
+}
+
+logLevel
+getLogThreshold()
+{
+    return static_cast<logLevel>(LOG_THRESHOLD);
 }
 
 void

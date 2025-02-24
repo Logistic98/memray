@@ -16,12 +16,16 @@ class Sink
     virtual bool writeAll(const char* data, size_t length) = 0;
     virtual bool seek(off_t offset, int whence) = 0;
     virtual std::unique_ptr<Sink> cloneInChildProcess() = 0;
+    virtual bool flush()
+    {
+        return true;
+    }
 };
 
 class FileSink : public memray::io::Sink
 {
   public:
-    FileSink(const std::string& file_name, bool overwrite);
+    FileSink(const std::string& file_name, bool overwrite, bool compress);
     ~FileSink() override;
     FileSink(FileSink&) = delete;
     FileSink(FileSink&&) = delete;
@@ -33,11 +37,14 @@ class FileSink : public memray::io::Sink
     std::unique_ptr<Sink> cloneInChildProcess() override;
 
   private:
+    void compress() noexcept;
     bool grow(size_t needed);
     bool slideWindow();
     size_t bytesBeyondBufferNeedle();
 
+    std::string d_filename;
     std::string d_fileNameStem;
+    bool d_compress{1};
     int d_fd{-1};
     size_t d_fileSize{0};
     const size_t BUFFER_SIZE{16 * 1024 * 1024};  // 16 MiB
@@ -61,11 +68,12 @@ class SocketSink : public Sink
     bool writeAll(const char* data, size_t length) override;
     bool seek(off_t offset, int whence) override;
     std::unique_ptr<Sink> cloneInChildProcess() override;
+    bool flush() override;
 
   private:
     size_t freeSpaceInBuffer();
     void open();
-    bool flush();
+    bool _flush();
 
     const std::string d_host;
     uint16_t d_port;

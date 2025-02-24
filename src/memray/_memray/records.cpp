@@ -1,9 +1,13 @@
-#include "Python.h"
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
 
 #include "python_helpers.h"
 #include "records.h"
 
 namespace memray::tracking_api {
+
+const char MAGIC[7] = "memray";
+
 PyObject*
 Allocation::toPythonObject() const
 {
@@ -49,6 +53,36 @@ Allocation::toPythonObject() const
     PyTuple_SET_ITEM(tuple, 7, elem);
 #undef __CHECK_ERROR
     return tuple;
+}
+
+Allocation
+AggregatedAllocation::contributionToHighWaterMark() const
+{
+    return {
+            tid,
+            0,
+            bytes_in_high_water_mark,
+            allocator,
+            native_frame_id,
+            frame_index,
+            native_segment_generation,
+            n_allocations_in_high_water_mark,
+    };
+}
+
+Allocation
+AggregatedAllocation::contributionToLeaks() const
+{
+    return {
+            tid,
+            0,
+            bytes_leaked,
+            allocator,
+            native_frame_id,
+            frame_index,
+            native_segment_generation,
+            n_allocations_leaked,
+    };
 }
 
 PyObject*

@@ -3,7 +3,10 @@
 #include <atomic>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <string>
+
+#include "lz4_stream.h"
 
 namespace memray::io {
 
@@ -36,8 +39,12 @@ class FileSource : public Source
 
   private:
     void _close();
+    void findReadableSize();
     const std::string& d_file_name;
-    std::ifstream d_stream;
+    std::shared_ptr<std::ifstream> d_raw_stream;
+    std::shared_ptr<std::istream> d_stream;
+    std::streamoff d_readable_size{};
+    std::streamoff d_bytes_read{};
 };
 
 class SocketBuf : public std::streambuf

@@ -1,9 +1,11 @@
+from ._ipython import load_ipython_extension
 from ._memray import AllocationRecord
 from ._memray import AllocatorType
 from ._memray import Destination
 from ._memray import FileDestination
+from ._memray import FileFormat
 from ._memray import FileReader
-from ._memray import MemoryRecord
+from ._memray import MemorySnapshot
 from ._memray import SocketDestination
 from ._memray import SocketReader
 from ._memray import Tracker
@@ -16,7 +18,8 @@ from ._version import __version__
 __all__ = [
     "AllocationRecord",
     "AllocatorType",
-    "MemoryRecord",
+    "FileFormat",
+    "MemorySnapshot",
     "dump_all_records",
     "start_thread_trace",
     "Tracker",
@@ -28,4 +31,5 @@ __all__ = [
     "Metadata",
     "__version__",
     "set_log_level",
+    "load_ipython_extension",
 ]

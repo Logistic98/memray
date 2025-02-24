@@ -1,16 +1,26 @@
 import _ from "lodash";
 
 export function initMemoryGraph(memory_records) {
-  const x = memory_records.map((a) => new Date(a[0]));
-  const y = memory_records.map((a) => a[1]);
+  const time = memory_records.map((a) => new Date(a[0]));
+  const resident_size = memory_records.map((a) => a[1]);
+  const heap_size = memory_records.map((a) => a[2]);
+  const mode = memory_records.length > 1 ? "lines" : "markers";
 
-  var trace = {
-    x,
-    y,
-    mode: "lines",
+  var resident_size_plot = {
+    x: time,
+    y: resident_size,
+    mode: mode,
+    name: "Resident size",
   };
 
-  var data = [trace];
+  var heap_size_plot = {
+    x: time,
+    y: heap_size,
+    mode: mode,
+    name: "Heap size",
+  };
+
+  var data = [resident_size_plot, heap_size_plot];
 
   var layout = {
     xaxis: {
@@ -20,7 +30,7 @@ export function initMemoryGraph(memory_records) {
     },
     yaxis: {
       title: {
-        text: "Resident Size",
+        text: "Memory Size",
       },
       tickformat: ".4~s",
       exponentformat: "B",
@@ -43,6 +53,7 @@ export function initMemoryGraph(memory_records) {
       exponentformat: "B",
       ticksuffix: "B",
     },
+    showlegend: false,
   };
   var config = {
     responsive: true,
@@ -149,15 +160,16 @@ export function filterChildThreads(root, threadId) {
 }
 
 /**
- * Recursively filter out nodes where the `interesting` property is set to `false`.
+ * Recursively filter out nodes where the given filter function return `false`.
  *
  * @param root Root node.
+ * @param func The filter function.
  * @returns {NonNullable<any>} A copy of the input object with the filtering applied.
  */
-export function filterUninteresting(root) {
+function filterFramesByFunc(root, func) {
   function filterChildren(node) {
     let result = [];
-    if (!node.interesting) {
+    if (!func(node)) {
       for (const child of node.children) {
         result.push(...filterChildren(child));
       }
@@ -178,6 +190,18 @@ export function filterUninteresting(root) {
     children.push(...filterChildren(child));
   }
   return _.defaults({ children: children }, root);
+}
+
+export function filterUninteresting(root) {
+  return filterFramesByFunc(root, (node) => {
+    return node.interesting;
+  });
+}
+
+export function filterImportSystem(root) {
+  return filterFramesByFunc(root, (node) => {
+    return !node.import_system;
+  });
 }
 
 /**

@@ -1,4 +1,5 @@
 """Tools for processing and filtering stack frames."""
+import functools
 import re
 from typing import Tuple
 
@@ -33,31 +34,46 @@ SYMBOL_IGNORELIST = {
 }
 
 
-def is_cpython_internal(frame: StackFrame) -> bool:
-    symbol, file, *_ = frame
+@functools.lru_cache(maxsize=1000)
+def _is_cpython_internal_symbol(symbol: str, file: str) -> bool:
+    if "PyEval_EvalFrameEx" in symbol or "_PyEval_EvalFrameDefault" in symbol:
+        is_candidate = True
+    elif symbol.startswith(("PyEval", "_Py")):
+        is_candidate = True
+    elif "vectorcall" in symbol.lower():
+        is_candidate = True
+    elif symbol in SYMBOL_IGNORELIST:
+        is_candidate = True
+    elif "Objects/call.c" in file:
+        is_candidate = True
+    else:
+        is_candidate = False
 
-    def _is_candidate() -> bool:
-        if "PyEval_EvalFrameEx" in symbol or "_PyEval_EvalFrameDefault" in symbol:
-            return True
-        if symbol.startswith(("PyEval", "_Py")):
-            return True
-        if "vectorcall" in symbol.lower():
-            return True
-        if symbol in SYMBOL_IGNORELIST:
-            return True
-        if "Objects/call.c" in file:
-            return True
-        return False
-
-    if _is_candidate():
+    if is_candidate:
         return re.search(RE_CPYTHON_PATHS, file) is not None
     return False
 
 
-def is_frame_interesting(frame: StackFrame) -> bool:
-    function, file, *_ = frame
+def is_cpython_internal(frame: StackFrame) -> bool:
+    symbol, file, _ = frame
+    return _is_cpython_internal_symbol(symbol, file)
 
-    if file.endswith("runpy.py"):
+
+def is_frame_interesting(frame: StackFrame) -> bool:
+    function, file, _ = frame
+
+    if file.endswith("runpy.py") or file == "<frozen runpy>":
         return False
 
-    return not is_cpython_internal(frame)
+    return not _is_cpython_internal_symbol(function, file)
+
+
+def is_frame_from_import_system(frame: StackFrame) -> bool:
+    function, file, _ = frame
+    if "frozen importlib" in file:
+        return True
+    if function in {"import_name", "import_from", "import_all_from"} and file.endswith(
+        "ceval.c"
+    ):
+        return True
+    return False

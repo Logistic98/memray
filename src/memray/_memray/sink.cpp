@@ -1,19 +1,19 @@
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
 #include <cerrno>
 #include <cstdio>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <netdb.h>
-#include <stdexcept>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <utility>
 
-#include <Python.h>
-
 #include "exceptions.h"
+#include "lz4_stream.h"
 #include "sink.h"
 
 namespace memray::io {
@@ -21,6 +21,25 @@ namespace memray::io {
 using namespace memray::exception;
 
 namespace {  // unnamed
+
+#ifdef __APPLE__
+static int
+posix_fallocate(int fd, off_t offset, off_t len)
+{
+    fstore_t store = {F_ALLOCATEALL, F_PEOFPOSMODE, 0, len, 0};
+    int res = ::fcntl(fd, F_PREALLOCATE, &store);
+    if (res != 0) {
+        return errno;
+    }
+    do {
+        res = ::ftruncate(fd, offset + len);
+    } while (res != 0 && errno == EINTR);
+    if (res != 0) {
+        return errno;
+    }
+    return 0;
+}
+#endif
 
 std::string
 removeSuffix(const std::string& s, const std::string& suffix)
@@ -68,8 +87,10 @@ FileSink::writeAll(const char* data, size_t length)
     return true;
 }
 
-FileSink::FileSink(const std::string& file_name, bool overwrite)
-: d_fileNameStem(removeSuffix(file_name, "." + std::to_string(::getpid())))
+FileSink::FileSink(const std::string& file_name, bool overwrite, bool compress)
+: d_filename(file_name)
+, d_fileNameStem(removeSuffix(file_name, "." + std::to_string(::getpid())))
+, d_compress(compress)
 {
     int flags = O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC;
     if (!overwrite) {
@@ -128,24 +149,21 @@ FileSink::seek(off_t offset, int whence)
 bool
 FileSink::grow(size_t needed)
 {
-    // Grow to next multiple of 4KiB that is strictly > 110% of current size + needed
+    static size_t pagesize = sysconf(_SC_PAGESIZE);
+    // Grow to next multiple of the page size that is strictly > 110% of current size + needed
     size_t new_size = (d_fileSize + needed) * 1.1;
-    new_size = (new_size / 4096 + 1) * 4096;
+    new_size = (new_size / pagesize + 1) * pagesize;
     assert(new_size > d_fileSize);  // check for overflow
 
-    // Seek to 1 byte before the new size
-    off_t offset = lseek(d_fd, new_size - 1, SEEK_SET);
-    if (offset == -1) {
-        return false;
-    }
-
-    // Then write 1 byte.
-    ssize_t rc;
+    off_t delta = new_size - d_fileSize;
+    int rc;
     do {
-        rc = write(d_fd, "\0", 1);
-    } while (rc < 0 && errno == EINTR);
+        // posix_fallocate returns an error number instead of setting errno
+        rc = posix_fallocate(d_fd, d_fileSize, delta);
+    } while (rc == EINTR);
 
-    if (rc < 0) {
+    if (rc != 0) {
+        errno = rc;
         return false;
     }
 
@@ -167,7 +185,42 @@ std::unique_ptr<Sink>
 FileSink::cloneInChildProcess()
 {
     std::string file_name = d_fileNameStem + "." + std::to_string(::getpid());
-    return std::make_unique<FileSink>(file_name, true);
+    return std::make_unique<FileSink>(file_name, true, d_compress);
+}
+
+void
+FileSink::compress() noexcept
+{
+    std::ifstream in_file(d_filename);
+    std::string tmp_filename = d_filename + ".lz4.tmp";
+    std::ofstream out_file(tmp_filename);
+    bool success = true;
+    constexpr size_t bufsize = 4 * 1024;
+
+    // lz4_stream is using exceptions rather than failbit/badbit
+    try {
+        lz4_stream::ostream lz4_stream(out_file);
+        std::vector<char> buf(bufsize);
+        while (in_file) {
+            in_file.read(&buf[0], buf.size());
+            lz4_stream.write(&buf[0], in_file.gcount());
+        }
+    } catch (...) {
+        success = false;
+    }
+
+    out_file.close();
+    if (!in_file.eof() || !out_file) {
+        success = false;
+    }
+
+    if (!success) {
+        std::cerr << "Failed to compress input file" << std::endl;
+        ::unlink(tmp_filename.c_str());
+    } else if (0 != std::rename(tmp_filename.c_str(), d_filename.c_str())) {
+        std::perror("Error moving compressed file back to original name");
+        ::unlink(tmp_filename.c_str());
+    }
 }
 
 FileSink::~FileSink()
@@ -180,6 +233,10 @@ FileSink::~FileSink()
     }
     if (d_fd != -1) {
         ::close(d_fd);
+    }
+
+    if (d_compress) {
+        compress();
     }
 }
 
@@ -220,6 +277,12 @@ SocketSink::writeAll(const char* data, size_t length)
 bool
 SocketSink::flush()
 {
+    return _flush();
+}
+
+bool
+SocketSink::_flush()
+{
     const char* data = d_buffer.get();
     size_t length = d_bufferNeedle - data;
 
@@ -256,7 +319,7 @@ SocketSink::cloneInChildProcess()
 SocketSink::~SocketSink()
 {
     if (d_socket_open) {
-        flush();
+        _flush();
         ::close(d_socket_fd);
         d_socket_open = false;
     }

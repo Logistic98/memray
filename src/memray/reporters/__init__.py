@@ -1,11 +1,12 @@
+import sys
 from typing import TextIO
 
 from memray import Metadata
 
-try:
+if sys.version_info >= (3, 8):
     from typing import Protocol
-except ImportError:
-    from typing_extensions import Protocol  # type: ignore
+else:
+    from typing_extensions import Protocol
 
 
 class BaseReporter(Protocol):
@@ -15,5 +16,6 @@ class BaseReporter(Protocol):
         metadata: Metadata,
         show_memory_leaks: bool,
         merge_threads: bool,
+        inverted: bool,
     ) -> None:
         ...

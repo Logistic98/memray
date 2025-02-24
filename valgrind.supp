@@ -13,6 +13,23 @@
    ...
 }
 
+# Any problems in Py_Initialize are before the Memray module has even
+# been imported, and so aren't something we need to think about.
+{
+   <invalid_read_in_py_initialize>
+   Memcheck:Addr32
+   ...
+   fun:Py_Initialize*
+   ...
+}
+{
+   <jump_depending_on_uninitialized_memory_in_py_initialize>
+   Memcheck:Cond
+   ...
+   fun:Py_Initialize*
+   ...
+}
+
 # CPython does not deallocate multitude of immortal objects
 # and this confuses valgrind. For this, we want to suppress
 # all traces that are not 'definite lost' that originated from
@@ -81,7 +98,7 @@
    <cython_cached_constants>
    Memcheck:Leak
    ...
-   fun:__Pyx_InitCachedConstants
+   fun:*__Pyx_InitCachedConstants*
    ...
 }
 
@@ -258,6 +275,15 @@
    ...
 }
 
+{
+   <insert_a_suppression_name_here>
+   Helgrind:Race
+   fun:*Tracker*BackgroundThread*start*
+   ...
+   fun:start_thread
+   fun:clone
+}
+
 # Python GIL false positives
 
 {
@@ -297,6 +323,19 @@
    ...
 }
 
+# Helgrind false positives
+
+# Helgrind warns if a condition variable is signalled while the lock is not
+# held, but pthreads explicitly allow this case. Memray is doing this when
+# stopping the background thread that collects RSS info, and CPython does this
+# for the GIL.
+{
+   <signalling_cond_var_with_mutex_unlocked>
+   Helgrind:Dubious
+   ...
+   obj:*
+}
+
 # libunwind
 
 # `validate_mem` checks whether a memory region is both mapped and readable. It
@@ -317,7 +356,7 @@
    write(buf)
    ...
    fun:backtrace
-   fun:unwind
+   fun:fill
    ...
 }
 {
@@ -326,7 +365,7 @@
    msync(start)
    ...
    fun:backtrace
-   fun:unwind
+   fun:fill
    ...
 }
 {
@@ -334,7 +373,7 @@
    Memcheck:Cond
    ...
    fun:backtrace
-   fun:unwind
+   fun:fill
    ...
 }
 
@@ -349,5 +388,27 @@
    fun:_dl_catch_exception
    ...
    fun:_dl_open
+   ...
+}
+
+{
+   <dlopen_is_drunk_go_home_now_with_calloc>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:calloc
+   ...
+   fun:_dl_catch_exception
+   ...
+   fun:_dl_open
+   ...
+}
+
+
+{
+   <dlopen_mutex_invalid_argument>
+   Helgrind:Misc
+   ...
+   fun:_dl_fini
+   fun:__run_exit_handlers
    ...
 }

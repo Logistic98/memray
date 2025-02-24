@@ -26,7 +26,7 @@ MULTI_ALLOCATION_COUNT = 10
 #
 _SCRIPT_TEMPLATE = """
 import sys
-from memray._memray import MemoryAllocator
+from memray._test import MemoryAllocator
 from memray._memray import SocketDestination
 from memray._memray import Tracker
 
@@ -100,6 +100,8 @@ def run_till_snapshot_point(
 
     script = _SCRIPT_TEMPLATE.format(body=program)
 
+    env = os.environ.copy()
+    env.pop("PYTHONMALLOC", None)
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -108,7 +110,8 @@ def run_till_snapshot_point(
             str(free_port),
             allocations_made,
             snapshot_taken,
-        ]
+        ],
+        env=env,
     )
 
     try:
@@ -274,7 +277,7 @@ class TestSocketReaderAccess:
 
         symbol, filename, lineno = allocation.stack_trace()[0]
         assert symbol == "valloc"
-        assert filename == "src/memray/_memray_test_utils.pyx"
+        assert filename.endswith("/_test.py")
         assert 0 < lineno < 200
 
     @pytest.mark.valgrind
@@ -302,7 +305,7 @@ class TestSocketReaderAccess:
 
         symbol, filename, lineno = allocation.stack_trace()[0]
         assert symbol == "valloc"
-        assert filename == "src/memray/_memray_test_utils.pyx"
+        assert filename.endswith("/_test.py")
         assert 0 < lineno < 200
 
     @pytest.mark.valgrind
@@ -373,7 +376,7 @@ class TestSocketReaderAccess:
         # GIVEN
         script = textwrap.dedent(
             f"""\
-            from memray._memray import MemoryAllocator
+            from memray._test import MemoryAllocator
             from memray._memray import SocketDestination
             from memray._memray import Tracker
             from itertools import count

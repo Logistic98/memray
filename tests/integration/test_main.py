@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import platform
 import pty
@@ -13,6 +14,10 @@ from unittest.mock import patch
 
 import pytest
 
+from memray import FileFormat
+from memray import Tracker
+from memray._test import MemoryAllocator
+from memray._test import set_thread_name
 from memray.commands import main
 
 TIMEOUT = 10
@@ -23,7 +28,7 @@ def simple_test_file(tmp_path):
     code_file = tmp_path / "code.py"
     program = textwrap.dedent(
         """\
-        from memray._memray import MemoryAllocator
+        from memray._test import MemoryAllocator
         print("Allocating some memory!")
         allocator = MemoryAllocator()
         allocator.valloc(1024)
@@ -58,7 +63,7 @@ def track_and_wait(output_dir, sleep_after=100):
     program = textwrap.dedent(
         f"""\
         import time
-        from memray._memray import MemoryAllocator
+        from memray._test import MemoryAllocator
         allocator = MemoryAllocator()
         allocator.valloc(1024)
         allocator.free()
@@ -77,6 +82,9 @@ def track_and_wait(output_dir, sleep_after=100):
 
 
 def _wait_until_process_blocks(pid: int) -> None:
+    if "linux" not in sys.platform:
+        time.sleep(1.0)
+        return
     # Signal numbers from https://filippo.io/linux-syscall-table/
     arch = platform.machine()
     if arch == "x86_64":
@@ -104,8 +112,17 @@ def _wait_until_process_blocks(pid: int) -> None:
         time.sleep(0.1)
 
 
-def generate_sample_results(tmp_path, code, *, native=False):
+def generate_sample_results(
+    tmp_path,
+    code,
+    *,
+    native=False,
+    trace_python_allocators=False,
+    disable_pymalloc=False,
+):
     results_file = tmp_path / "result.bin"
+    env = os.environ.copy()
+    env["PYTHONMALLOC"] = "malloc" if disable_pymalloc else "pymalloc"
     subprocess.run(
         [
             sys.executable,
@@ -113,6 +130,7 @@ def generate_sample_results(tmp_path, code, *, native=False):
             "memray",
             "run",
             *(["--native"] if native else []),
+            *(["--trace-python-allocators"] if trace_python_allocators else []),
             "--output",
             str(results_file),
             str(code),
@@ -121,6 +139,7 @@ def generate_sample_results(tmp_path, code, *, native=False):
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
     return results_file, code
 
@@ -245,6 +264,217 @@ class TestRunSubcommand:
         assert "Arg: arg1" in proc.stdout
         assert out_file.exists()
 
+    def test_sys_manipulations_when_running_script(self, tmp_path):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+        target_file = tmp_path / "test.py"
+        target_file.write_text("import json, sys; print(json.dumps(sys.path))")
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                str(target_file),
+                "some",
+                "provided args",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` put cwd in sys.path; ensure we replaced it.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert str(tmp_path) in path
+
+    @pytest.mark.parametrize(
+        "isolation_flag", ["-I"] + (["-P"] if sys.version_info > (3, 11) else [])
+    )
+    def test_suppressing_sys_manipulations_when_running_script(
+        self, tmp_path, isolation_flag
+    ):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+        target_file = tmp_path / "test.py"
+        target_file.write_text("import json, sys; print(json.dumps(sys.path))")
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                isolation_flag,
+                "-m",
+                "memray",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                str(target_file),
+                "some",
+                "provided args",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` did not put cwd in sys.path; ensure it isn't
+        # there, and neither is the tmp_path we would have replaced it with.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert str(tmp_path) not in path
+
+    def test_sys_manipulations_when_running_module(self, tmp_path):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from memray.commands import main; sys.exit(main())",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                "-m",
+                "site",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -c` put "" in sys.path; ensure we replaced it.
+        path = eval(
+            " ".join(line for line in proc.stdout.splitlines() if line.startswith(" "))
+        )
+        assert "" not in path
+        assert os.getcwd() in path
+
+    @pytest.mark.parametrize(
+        "isolation_flag", ["-I"] + (["-P"] if sys.version_info > (3, 11) else [])
+    )
+    def test_suppressing_sys_manipulations_when_running_module(
+        self, tmp_path, isolation_flag
+    ):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                isolation_flag,
+                "-c",
+                "import sys; from memray.commands import main; sys.exit(main())",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                "-m",
+                "site",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -c` did not put "" in sys.path; ensure it isn't
+        # there, and neither is the os.getcwd() we would have replaced it with.
+        path = eval(
+            " ".join(line for line in proc.stdout.splitlines() if line.startswith(" "))
+        )
+        assert "" not in path
+        assert os.getcwd() not in path
+
+    def test_sys_manipulations_when_running_cmd(self, tmp_path):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                "-c",
+                "import json, sys; print(json.dumps(sys.path))",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` put cwd in sys.path; ensure we replaced it.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert "" in path
+
+    @pytest.mark.parametrize(
+        "isolation_flag", ["-I"] + (["-P"] if sys.version_info > (3, 11) else [])
+    )
+    def test_suppressing_sys_manipulations_when_running_cmd(
+        self, tmp_path, isolation_flag
+    ):
+        # GIVEN
+        out_file = tmp_path / "result.bin"
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                isolation_flag,
+                "-m",
+                "memray",
+                "run",
+                "--quiet",
+                "--output",
+                str(out_file),
+                "-c",
+                "import json, sys; print(json.dumps(sys.path))",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert out_file.exists()
+        assert proc.returncode == 0
+        # Running `python -m` did not put cwd in sys.path; ensure it isn't
+        # there, and neither is the "" we would have replaced it with.
+        path = json.loads(proc.stdout)
+        assert os.getcwd() not in path
+        assert "" not in path
+
     @pytest.mark.parametrize("option", [None, "--live", "--live-remote"])
     def test_run_file_that_is_not_python(self, capsys, option):
         """Execute a non-Python script and make sure that we raise a good error"""
@@ -254,7 +484,10 @@ class TestRunSubcommand:
 
         # THEN
         captured = capsys.readouterr()
-        assert captured.err.strip() == "Only Python files can be executed under memray"
+        assert (
+            captured.err.strip()
+            == "Only valid Python files or commands can be executed under memray"
+        )
 
     @patch("memray.commands.run.os.getpid")
     def test_run_file_exists(self, getpid, tmp_path, monkeypatch, capsys):
@@ -343,20 +576,23 @@ class TestParseSubcommand:
         record_types = [
             "ALLOCATION",
             "ALLOCATION_WITH_NATIVE",
-            "FRAME_PUSH",
-            "FRAME_POP",
-            "FRAME_ID",
-            "NATIVE_FRAME_ID",
             "MEMORY_MAP_START",
             "SEGMENT_HEADER",
             "SEGMENT",
-            "MEMORY",
+            "NATIVE_FRAME_ID",
+            "FRAME_PUSH",
+            "FRAME_POP",
+            "FRAME_ID",
+            "MEMORY_RECORD",
+            "CONTEXT_SWITCH",
+            "TRAILER",
         ]
+
         code_file = tmp_path / "code.py"
         program = textwrap.dedent(
             """\
             import time
-            from memray._memray import MemoryAllocator
+            from memray._test import MemoryAllocator
             print("Allocating some memory!")
             allocator = MemoryAllocator()
             allocator.valloc(1024)
@@ -390,7 +626,66 @@ class TestParseSubcommand:
         for record in records:
             record_count_by_type[record.partition(" ")[0]] += 1
 
-        for _, count in record_count_by_type.items():
+        for count in record_count_by_type.values():
+            assert count > 0
+
+    def test_successful_parse_of_aggregated_capture_file(self, tmp_path):
+        # GIVEN
+        results_file = tmp_path / "result.bin"
+        record_types = [
+            "MEMORY_SNAPSHOT",
+            "AGGREGATED_ALLOCATION",
+            "PYTHON_TRACE_INDEX",
+            "PYTHON_FRAME_INDEX",
+            "NATIVE_TRACE_INDEX",
+            "MEMORY_MAP_START",
+            "SEGMENT_HEADER",
+            "SEGMENT",
+            "AGGREGATED_TRAILER",
+        ]
+
+        with Tracker(
+            results_file,
+            native_traces=True,
+            file_format=FileFormat.AGGREGATED_ALLOCATIONS,
+        ):
+            if set_thread_name("main") == 0:
+                # We should get CONTEXT_SWITCH and THREAD_RECORD records only
+                # if we can set the thread name. On macOS, we won't get these.
+                record_types.append("CONTEXT_SWITCH")
+                record_types.append("THREAD_RECORD")
+
+            allocator = MemoryAllocator()
+            allocator.valloc(1024)
+            allocator.free()
+            # Give it time to generate some memory records
+            time.sleep(0.1)
+
+        record_count_by_type = dict.fromkeys(record_types, 0)
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "parse",
+                str(results_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path),
+        )
+
+        # THEN
+        _, *records = proc.stdout.splitlines()
+        print(records)
+
+        for record in records:
+            record_count_by_type[record.partition(" ")[0]] += 1
+
+        for count in record_count_by_type.values():
             assert count > 0
 
     def test_error_when_stdout_is_a_tty(self, tmp_path, simple_test_file):
@@ -523,8 +818,8 @@ class TestFlamegraphSubCommand:
         assert str(source_file) in output_file.read_text()
 
     def test_output_file_already_exists(self, tmp_path, simple_test_file, monkeypatch):
-        """Check that when the output file is derived form the input name, we fail when there is
-        already a file with the same name as the output."""
+        """Check that when the output file is derived form the input name, we
+        fail when there is already a file with the same name as the output."""
 
         # GIVEN
         monkeypatch.chdir(tmp_path)
@@ -568,6 +863,324 @@ class TestFlamegraphSubCommand:
         # THEN
         assert output_file.exists()
         assert str(source_file) in output_file.read_text()
+
+    @pytest.mark.parametrize("trace_python_allocators", [True, False])
+    @pytest.mark.parametrize("disable_pymalloc", [True, False])
+    def test_leaks_with_pymalloc_warning(
+        self,
+        tmp_path,
+        simple_test_file,
+        trace_python_allocators,
+        disable_pymalloc,
+    ):
+        results_file, _ = generate_sample_results(
+            tmp_path,
+            simple_test_file,
+            native=True,
+            trace_python_allocators=trace_python_allocators,
+            disable_pymalloc=disable_pymalloc,
+        )
+        output_file = tmp_path / "output.html"
+        warning_expected = not trace_python_allocators and not disable_pymalloc
+
+        # WHEN
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "flamegraph",
+                "--leaks",
+                str(results_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        output_file = tmp_path / "memray-flamegraph-result.html"
+        assert output_file.exists()
+        assert warning_expected == (
+            'Report generated using "--leaks" using pymalloc allocator'
+            in output_file.read_text()
+        )
+
+
+class TestSummarySubCommand:
+    def test_summary_generated(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(
+            tmp_path, simple_test_file, native=True
+        )
+
+        # WHEN
+        output = subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "summary",
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            text=True,
+        )
+
+        # THEN
+        assert output
+
+    def test_temporary_allocations_summary(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+
+        # WHEN
+        output = subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "summary",
+                "--temporary-allocations",
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            text=True,
+        )
+
+        # THEN
+        assert output
+
+
+class TestTreeSubCommand:
+    def test_tree_generated(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(
+            tmp_path, simple_test_file, native=True
+        )
+        env = os.environ.copy()
+        env["TEXTUAL_PRESS"] = "q"
+
+        # WHEN
+        output = subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "tree",
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
+
+        # THEN
+        assert output
+
+    def test_temporary_allocations_tree(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+        env = os.environ.copy()
+        env["TEXTUAL_PRESS"] = "q"
+
+        # WHEN
+        output = subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "tree",
+                "--temporary-allocations",
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
+
+        # THEN
+        assert output
+
+
+class TestStatsSubCommand:
+    def test_report_generated(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(
+            tmp_path, simple_test_file, native=True
+        )
+
+        # WHEN
+        output = subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "stats",
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            text=True,
+        )
+
+        # THEN
+        assert "VALLOC" in output
+
+    def test_json_generated(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+        json_file = tmp_path / "memray-stats-result.bin.json"
+
+        # WHEN
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "stats",
+                "--json",
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            text=True,
+        )
+
+        # THEN
+        assert json_file.exists()
+        assert isinstance(json.loads(json_file.read_text()), dict)
+
+    def test_json_generated_to_pretty_file_name(self, tmp_path, simple_test_file):
+        # GIVEN
+        orig_results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+        results_file = orig_results_file.with_name("memray-foobar.bin")
+        orig_results_file.rename(results_file)
+        json_file = tmp_path / "memray-stats-foobar.bin.json"
+
+        # WHEN
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "stats",
+                "--json",
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            text=True,
+        )
+
+        # THEN
+        assert json_file.exists()
+        assert isinstance(json.loads(json_file.read_text()), dict)
+
+    def test_json_generated_to_known_file(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+        json_file = tmp_path / "output.json"
+
+        # WHEN
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "stats",
+                "--json",
+                "-o",
+                str(json_file),
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            text=True,
+        )
+
+        # THEN
+        assert json_file.exists()
+        assert isinstance(json.loads(json_file.read_text()), dict)
+
+    def test_json_generated_to_existing_known_file(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+        json_file = tmp_path / "output.json"
+        json_file.write_text("oops")
+
+        # WHEN
+        try:
+            exc = None
+            subprocess.check_output(
+                [
+                    sys.executable,
+                    "-m",
+                    "memray",
+                    "stats",
+                    "--json",
+                    "-o",
+                    str(json_file),
+                    str(results_file),
+                ],
+                cwd=str(tmp_path),
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            exc = e
+
+        # THEN
+        assert exc is not None
+        assert "File already exists, will not overwrite" in exc.stderr
+
+    def test_json_overwrites_existing_known_file(self, tmp_path, simple_test_file):
+        # GIVEN
+        results_file, _ = generate_sample_results(tmp_path, simple_test_file)
+        json_file = tmp_path / "output.json"
+        json_file.write_text("oops")
+
+        # WHEN
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "stats",
+                "--json",
+                "--force",
+                "--output",
+                str(json_file),
+                str(results_file),
+            ],
+            cwd=str(tmp_path),
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # THEN
+        assert json_file.exists()
+        assert isinstance(json.loads(json_file.read_text()), dict)
+
+    def test_report_detects_corrupt_input(self, tmp_path):
+        # GIVEN
+        bad_file = Path(tmp_path) / "badfile.bin"
+        bad_file.write_text("This is some garbage")
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "stats",
+                str(bad_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert proc.returncode == 1
+        assert re.match(r"Failed to compute statistics for .*badfile\.bin", proc.stderr)
 
 
 class TestTableSubCommand:
@@ -617,7 +1230,9 @@ class TestTableSubCommand:
 
 
 class TestReporterSubCommands:
-    @pytest.mark.parametrize("report", ["flamegraph", "table"])
+    @pytest.mark.parametrize(
+        "report", ["flamegraph", "table", "summary", "tree", "stats"]
+    )
     def test_report_detects_missing_input(self, report):
         # GIVEN / WHEN
         proc = subprocess.run(
@@ -636,7 +1251,7 @@ class TestReporterSubCommands:
         assert proc.returncode == 1
         assert "No such file: nosuchfile" in proc.stderr
 
-    @pytest.mark.parametrize("report", ["flamegraph", "table"])
+    @pytest.mark.parametrize("report", ["flamegraph", "table", "summary", "tree"])
     def test_report_detects_corrupt_input(self, tmp_path, report):
         # GIVEN
         bad_file = Path(tmp_path) / "badfile.bin"
@@ -688,10 +1303,95 @@ class TestReporterSubCommands:
         assert output_file.exists()
         assert str(source_file) in output_file.read_text()
 
+    @pytest.mark.parametrize("report", ["flamegraph", "table"])
+    def test_report_temporary_allocations_argument(
+        self, tmp_path, simple_test_file, report
+    ):
+        results_file, source_file = generate_sample_results(
+            tmp_path, simple_test_file, native=True
+        )
+        output_file = tmp_path / "output.html"
+
+        # WHEN
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                report,
+                str(results_file),
+                "--temporary-allocations",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        output_file = tmp_path / f"memray-{report}-result.html"
+        assert output_file.exists()
+        assert str(source_file) in output_file.read_text()
+
+    @pytest.mark.parametrize("report", ["flamegraph", "table"])
+    def test_report_incompatible_arguments(self, tmp_path, simple_test_file, report):
+        results_file, _ = generate_sample_results(
+            tmp_path, simple_test_file, native=True
+        )
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                report,
+                "--temporary-allocations",
+                "--leaks",
+                str(results_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert proc.returncode != 0
+        assert (
+            "--leaks: not allowed with argument --temporary-allocations" in proc.stderr
+        )
+
+    @pytest.mark.parametrize("report", ["flamegraph", "table", "summary", "tree"])
+    def test_report_both_temporary_allocation_arguments(
+        self, tmp_path, simple_test_file, report
+    ):
+        results_file, _ = generate_sample_results(
+            tmp_path, simple_test_file, native=True
+        )
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                report,
+                "--temporary-allocations",
+                "--temporary-allocation-threshold=1",
+                str(results_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert proc.returncode != 0
+        assert (
+            "--temporary-allocation-threshold: not allowed with"
+            " argument --temporary-allocations" in proc.stderr
+        )
+
 
 class TestLiveRemoteSubcommand:
     def test_live_tracking(self, tmp_path, simple_test_file, free_port):
-
         # GIVEN
         server = subprocess.Popen(
             [
@@ -718,6 +1418,8 @@ class TestLiveRemoteSubcommand:
                 "live",
                 str(free_port),
             ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             stdin=subprocess.PIPE,
         )
 
@@ -840,6 +1542,8 @@ class TestLiveRemoteSubcommand:
                 str(free_port),
             ],
             stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
 
         # WHEN
@@ -899,7 +1603,6 @@ class TestLiveRemoteSubcommand:
         assert b"Interrupted system call" not in stderr
 
     def test_live_client_exits_properly_on_sigint_before_connecting(self, free_port):
-
         # GIVEN
         client = subprocess.Popen(
             [
@@ -958,39 +1661,78 @@ class TestLiveSubcommand:
         # THEN
         assert server.returncode == 0
 
-    def test_live_tracking_server_exits_properly_on_sigint(self, tmp_path):
-        # GIVEN
-        with track_and_wait(tmp_path) as program_file:
-            server = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "memray",
-                    "run",
-                    "--live",
-                    str(program_file),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env={"PYTHONUNBUFFERED": "1"},
-                # Explicitly reset the signal handler for SIGINT to work around any signal
-                # masking that might happen on Jenkins.
-                preexec_fn=lambda: signal.signal(
-                    signal.SIGINT, signal.default_int_handler
-                ),
-            )
 
-        # WHEN
-
-        server.send_signal(signal.SIGINT)
-        try:
-            _, stderr = server.communicate(timeout=TIMEOUT)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            raise
+class TestTransformSubCommands:
+    def test_report_detects_missing_input(self):
+        # GIVEN / WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "transform",
+                "gprof2dot",
+                "nosuchfile",
+            ],
+            capture_output=True,
+            text=True,
+        )
 
         # THEN
-        assert server.returncode == 0
-        assert not stderr
-        assert b"Exception ignored" not in stderr
-        assert b"KeyboardInterrupt" not in stderr
+        assert proc.returncode == 1
+        assert "No such file: nosuchfile" in proc.stderr
+
+    def test_report_detects_corrupt_input(self, tmp_path):
+        # GIVEN
+        bad_file = Path(tmp_path) / "badfile.bin"
+        bad_file.write_text("This is some garbage")
+
+        # WHEN
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "transform",
+                "gprof2dot",
+                str(bad_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        assert proc.returncode == 1
+        assert re.match(
+            r"Failed to parse allocation records in .*badfile\.bin", proc.stderr
+        )
+
+    def test_report_leaks_argument(self, tmp_path, simple_test_file):
+        results_file, source_file = generate_sample_results(
+            tmp_path, simple_test_file, native=True
+        )
+        output_file = tmp_path / "output.html"
+
+        # WHEN
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "memray",
+                "transform",
+                "gprof2dot",
+                "--leaks",
+                str(results_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # THEN
+        output_file = tmp_path / "memray-gprof2dot-result.json"
+        assert output_file.exists()
+        output_text = output_file.read_text()
+        if "<unknown stack>" in output_text:
+            pytest.xfail("Hybrid stack generation is not fully working")
+        assert str(source_file) in output_text

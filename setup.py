@@ -8,11 +8,15 @@ import tempfile
 from sys import platform
 from sys import version_info
 
+import pkgconfig
 from Cython.Build import cythonize
 from setuptools import Extension
-from setuptools import find_namespace_packages
+from setuptools import find_packages
 from setuptools import setup
 from setuptools.command.build_ext import build_ext as build_ext_orig
+
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = "linux" in sys.platform
 
 LIBBACKTRACE_LOCATION = (
     pathlib.Path(__file__).parent / "src" / "vendor" / "libbacktrace"
@@ -45,7 +49,6 @@ class BuildMemray(build_ext_orig):
         subprocess.run(command, check=True, **kwargs)
 
     def build_libbacktrace(self):
-
         archive_location = LIBBACKTRACE_LIBDIR / "libbacktrace.a"
 
         if archive_location.exists():
@@ -57,16 +60,21 @@ class BuildMemray(build_ext_orig):
                 cwd=LIBBACKTRACE_LOCATION.parent,
             )
 
+        configure_cmd = [
+            f"{LIBBACKTRACE_LOCATION}/configure",
+            "--with-pic",
+            "--prefix",
+            f"{LIBBACKTRACE_LOCATION}/install",
+            "--includedir",
+            f"{LIBBACKTRACE_LOCATION}/install/include/libbacktrace",
+        ]
+        libbacktrace_target = os.getenv("MEMRAY_LIBBACKTRACE_TARGET")
+        if libbacktrace_target is not None:
+            configure_cmd.extend(["--host", libbacktrace_target])
+
         with tempfile.TemporaryDirectory() as tmpdirname:
             self.announce_and_run(
-                [
-                    f"{LIBBACKTRACE_LOCATION}/configure",
-                    "--with-pic",
-                    "--prefix",
-                    f"{LIBBACKTRACE_LOCATION}/install",
-                    "--includedir",
-                    f"{LIBBACKTRACE_LOCATION}/install/include/libbacktrace",
-                ],
+                configure_cmd,
                 cwd=tmpdirname,
             )
             self.announce_and_run(["make", "-j"], cwd=tmpdirname)
@@ -81,11 +89,13 @@ class BuildMemray(build_ext_orig):
 
 
 install_requires = [
-    "jinja2",
+    "jinja2 >= 2.9",
     "typing_extensions; python_version < '3.8.0'",
-    "rich < 11.0.0",
+    "rich >= 11.2.0",
+    "textual >= 0.41.0",
 ]
 docs_requires = [
+    "IPython",
     "bump2version",
     "sphinx",
     "furo",
@@ -103,8 +113,14 @@ lint_requires = [
 
 test_requires = [
     "Cython",
+    "greenlet; python_version < '3.14'",
     "pytest",
     "pytest-cov",
+    "ipython",
+    "setuptools; python_version >= '3.12'",
+    "pytest-textual-snapshot",
+    "textual >= 0.43, != 0.65.2, != 0.66",
+    "packaging",
 ]
 
 benchmark_requires = [
@@ -121,6 +137,8 @@ if "--test-build" in sys.argv:
 if os.getenv("CYTHON_TEST_MACROS", None) is not None:
     TEST_BUILD = True
 
+MINIMIZE_INLINING = os.getenv("MEMRAY_MINIMIZE_INLINING", "") != ""
+
 COMPILER_DIRECTIVES = {
     "language_level": 3,
     "embedsignature": True,
@@ -133,7 +151,21 @@ COMPILER_DIRECTIVES = {
     "c_string_encoding": "utf8",
 }
 EXTRA_COMPILE_ARGS = []
+EXTRA_LINK_ARGS = []
 UNDEF_MACROS = []
+
+if MINIMIZE_INLINING:
+    EXTRA_COMPILE_ARGS.append("-Og")
+else:
+    EXTRA_COMPILE_ARGS.append("-flto")
+    EXTRA_LINK_ARGS.append("-flto")
+
+# For Python 3.9+, hide all of our symbols except the module init function. For
+# Python 3.8 and earlier this isn't as easy, because PyMODINIT_FUNC doesn't
+# include __attribute__((visibility ("default"))), and Cython doesn't give us
+# a way to add the attribute. So, skip this optimization on 3.8 and earlier.
+if sys.version_info[:2] >= (3, 9):
+    EXTRA_COMPILE_ARGS.append("-fvisibility=hidden")
 
 if TEST_BUILD:
     COMPILER_DIRECTIVES = {
@@ -149,10 +181,15 @@ if TEST_BUILD:
         "c_string_type": "unicode",
         "c_string_encoding": "utf8",
     }
-    EXTRA_COMPILE_ARGS = ["-D_GLIBCXX_DEBUG", "-D_LIBCPP_DEBUG"]
+    EXTRA_COMPILE_ARGS = []
     UNDEF_MACROS = ["NDEBUG"]
+    if IS_LINUX:
+        EXTRA_COMPILE_ARGS.extend(["-D_GLIBCXX_DEBUG", "-D_LIBCPP_DEBUG"])
 
 DEFINE_MACROS = []
+
+# Ensure that we have a 64-bit off_t in all translation units.
+DEFINE_MACROS.append(("_FILE_OFFSET_BITS", "64"))
 
 # memray uses thread local storage (TLS) variables. As memray is compiled
 # into a Python extension, is a shared object. TLS variables in shared objects
@@ -173,15 +210,35 @@ if os.getenv("NO_MEMRAY_FAST_TLS", None) is not None:
     MEMRAY_FAST_TLS = False
 
 if MEMRAY_FAST_TLS:
-    DEFINE_MACROS.append(("MEMRAY_TLS_MODEL", '"initial-exec"'))
+    DEFINE_MACROS.append(("USE_MEMRAY_TLS_MODEL", "1"))
+
+BINARY_FORMATS = {"darwin": "macho", "linux": "elf"}
+BINARY_FORMAT = BINARY_FORMATS.get(sys.platform, "elf")
+
+library_flags = {"libraries": ["lz4"]}
+if IS_LINUX:
+    library_flags["libraries"].append("unwind")
+    library_flags["libraries"].append("debuginfod")
+
+try:
+    library_flags = pkgconfig.parse(
+        " ".join(f"lib{libname}" for libname in library_flags["libraries"])
+    )
+except EnvironmentError as e:
+    print("pkg-config not found.", e)
+    print("Falling back to static flags.")
+except pkgconfig.PackageNotFoundError as e:
+    print("Package Not Found", e)
+    print("Falling back to static flags.")
 
 MEMRAY_EXTENSION = Extension(
     name="memray._memray",
     sources=[
         "src/memray/_memray.pyx",
+        "src/memray/_memray/compat.cpp",
         "src/memray/_memray/hooks.cpp",
         "src/memray/_memray/tracking_api.cpp",
-        "src/memray/_memray/elf_shenanigans.cpp",
+        f"src/memray/_memray/{BINARY_FORMAT}_shenanigans.cpp",
         "src/memray/_memray/logging.cpp",
         "src/memray/_memray/python_helpers.cpp",
         "src/memray/_memray/source.cpp",
@@ -193,20 +250,47 @@ MEMRAY_EXTENSION = Extension(
         "src/memray/_memray/socket_reader_thread.cpp",
         "src/memray/_memray/native_resolver.cpp",
     ],
-    libraries=["unwind"],
-    library_dirs=[str(LIBBACKTRACE_LIBDIR)],
-    include_dirs=["src", str(LIBBACKTRACE_INCLUDEDIRS)],
     language="c++",
     extra_compile_args=["-std=c++17", "-Wall", *EXTRA_COMPILE_ARGS],
-    extra_link_args=["-std=c++17", "-l:libbacktrace.a"],
+    extra_objects=[str(LIBBACKTRACE_LIBDIR / "libbacktrace.a")],
+    extra_link_args=["-std=c++17", *EXTRA_LINK_ARGS],
+    define_macros=DEFINE_MACROS,
+    undef_macros=UNDEF_MACROS,
+    **library_flags,
+)
+
+MEMRAY_EXTENSION.include_dirs[:0] = ["src", str(LIBBACKTRACE_INCLUDEDIRS)]
+MEMRAY_EXTENSION.libraries.append("dl")
+
+
+MEMRAY_TEST_EXTENSION = Extension(
+    name="memray._test_utils",
+    sources=[
+        "src/memray/_memray_test_utils.pyx",
+    ],
+    language="c++",
+    extra_compile_args=["-std=c++17", "-Wall", *EXTRA_COMPILE_ARGS],
+    extra_link_args=["-std=c++17", *EXTRA_LINK_ARGS],
     define_macros=DEFINE_MACROS,
     undef_macros=UNDEF_MACROS,
 )
 
-MEMRAY_EXTENSION.libraries.append("dl")
+MEMRAY_INJECT_EXTENSION = Extension(
+    name="memray._inject",
+    sources=[
+        "src/memray/_memray/inject.cpp",
+    ],
+    language="c++",
+    extra_compile_args=["-std=c++17", "-Wall", *EXTRA_COMPILE_ARGS],
+    extra_link_args=["-std=c++17", *EXTRA_LINK_ARGS],
+    define_macros=DEFINE_MACROS,
+    undef_macros=UNDEF_MACROS,
+    py_limited_api=True,
+)
 
-if "linux" not in platform:
-    raise RuntimeError("memray only supports Linux platforms")
+
+if not (IS_LINUX or IS_MAC):
+    raise RuntimeError(f"memray does not support this platform ({platform})")
 
 about = {}
 with open("src/memray/_version.py") as fp:
@@ -229,17 +313,22 @@ setup(
         "Intended Audience :: Developers",
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: POSIX :: Linux",
+        "Operating System :: MacOS",
+        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: Implementation :: CPython",
         "Topic :: Software Development :: Debuggers",
     ],
     license="Apache 2.0",
     package_dir={"": "src"},
-    packages=find_namespace_packages(where="src"),
+    packages=find_packages(where="src", exclude="memray/_memray/"),
     ext_modules=cythonize(
-        [MEMRAY_EXTENSION],
+        [MEMRAY_EXTENSION, MEMRAY_TEST_EXTENSION, MEMRAY_INJECT_EXTENSION],
         include_path=["src/memray"],
         compiler_directives=COMPILER_DIRECTIVES,
     ),
@@ -261,5 +350,4 @@ setup(
     cmdclass={
         "build_ext": BuildMemray,
     },
-    package_data={"memray": ["py.typed"]},
 )

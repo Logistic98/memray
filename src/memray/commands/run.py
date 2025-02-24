@@ -10,11 +10,14 @@ import sys
 import textwrap
 from contextlib import closing
 from contextlib import suppress
+from typing import Any
+from typing import Dict
 from typing import List
 from typing import Optional
 
 from memray import Destination
 from memray import FileDestination
+from memray import FileFormat
 from memray import SocketDestination
 from memray import Tracker
 from memray._errors import MemrayCommandError
@@ -28,30 +31,49 @@ def _get_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _should_modify_sys_path() -> bool:
+    isolated_mode = sys.flags.isolated
+    safe_path_mode = getattr(sys.flags, "safe_path", False)  # New in Python 3.11
+    return not isolated_mode and not safe_path_mode
+
+
 def _run_tracker(
     destination: Destination,
     args: argparse.Namespace,
     post_run_message: Optional[str] = None,
-    follow_fork: bool = False,
 ) -> None:
-    sys.argv = [args.script, *args.script_args]
-    if args.run_as_module:
-        sys.argv.insert(0, "-m")
     try:
-        kwargs = {}
-        if follow_fork:
+        kwargs: Dict[str, Any] = {}
+        if args.follow_fork:
             kwargs["follow_fork"] = True
+        if args.trace_python_allocators:
+            kwargs["trace_python_allocators"] = True
+        if args.aggregate:
+            kwargs["file_format"] = FileFormat.AGGREGATED_ALLOCATIONS
         tracker = Tracker(destination=destination, native_traces=args.native, **kwargs)
     except OSError as error:
         raise MemrayCommandError(str(error), exit_code=1)
 
     with tracker:
-        sys.argv[1:] = args.script_args
         pid = os.getpid()
         try:
             if args.run_as_module:
+                if _should_modify_sys_path():
+                    sys.path[0] = os.getcwd()
+                # run_module will replace argv[0] with the script's path
+                sys.argv = ["", *args.script_args]
                 runpy.run_module(args.script, run_name="__main__", alter_sys=True)
+            elif args.run_as_cmd:
+                if _should_modify_sys_path():
+                    sys.path[0] = ""
+                sys.argv = ["-c", *args.script_args]
+                exec(args.script, {"__name__": "__main__"})
             else:
+                if _should_modify_sys_path():
+                    sys.path[0] = str(
+                        pathlib.Path(args.script).resolve().parent.absolute()
+                    )
+                sys.argv = [args.script, *args.script_args]
                 runpy.run_path(args.script, run_name="__main__")
         finally:
             if not args.quiet and post_run_message is not None and pid == os.getpid():
@@ -61,14 +83,20 @@ def _run_tracker(
 def _child_process(
     port: int,
     native: bool,
+    trace_python_allocators: bool,
     run_as_module: bool,
+    run_as_cmd: bool,
     quiet: bool,
     script: str,
     script_args: List[str],
 ) -> None:
     args = argparse.Namespace(
         native=native,
+        trace_python_allocators=trace_python_allocators,
+        follow_fork=False,
+        aggregate=False,
         run_as_module=run_as_module,
+        run_as_cmd=run_as_cmd,
         quiet=quiet,
         script=script,
         script_args=script_args,
@@ -84,14 +112,14 @@ def _run_child_process_and_attach(args: argparse.Namespace) -> None:
         raise MemrayCommandError(f"Invalid port: {port}", exit_code=1)
 
     arguments = (
-        f"{port},{args.native},{args.run_as_module},{args.quiet},"
-        f'"{args.script}",{args.script_args}'
+        f"{port},{args.native},{args.trace_python_allocators},"
+        f"{args.run_as_module},{args.run_as_cmd},{args.quiet},"
+        f"{args.script!r},{args.script_args}"
     )
     tracked_app_cmd = [
         sys.executable,
         "-c",
-        f"from memray.commands.run import _child_process;"
-        f"_child_process({arguments})",
+        f"from memray.commands.run import _child_process;_child_process({arguments})",
     ]
     with contextlib.suppress(KeyboardInterrupt):
         with subprocess.Popen(
@@ -101,7 +129,9 @@ def _run_child_process_and_attach(args: argparse.Namespace) -> None:
             text=True,
         ) as process:
             try:
-                LiveCommand().start_live_interface(port)
+                LiveCommand().start_live_interface(
+                    port, cmdline_override=" ".join(sys.argv)
+                )
             except (Exception, KeyboardInterrupt) as error:
                 process.terminate()
                 raise error from None
@@ -128,8 +158,12 @@ def _run_with_socket_output(args: argparse.Namespace) -> None:
 
 def _run_with_file_output(args: argparse.Namespace) -> None:
     if args.output is None:
-        output = f"memray-{os.path.basename(args.script)}.{os.getpid()}.bin"
-        filename = os.path.join(os.path.dirname(args.script), output)
+        script_name = args.script
+        if args.run_as_cmd:
+            script_name = "string"
+
+        output = f"memray-{os.path.basename(script_name)}.{os.getpid()}.bin"
+        filename = os.path.join(os.path.dirname(script_name), output)
     else:
         filename = args.output
 
@@ -147,13 +181,14 @@ def _run_with_file_output(args: argparse.Namespace) -> None:
         """
     ).strip()
 
-    destination = FileDestination(path=filename, overwrite=args.force)
+    destination = FileDestination(
+        path=filename, overwrite=args.force, compress_on_exit=args.compress_on_exit
+    )
     try:
         _run_tracker(
             destination=destination,
             args=args,
             post_run_message=example_report_generation_message,
-            follow_fork=args.follow_fork,
         )
     except OSError as error:
         raise MemrayCommandError(str(error), exit_code=1)
@@ -163,7 +198,7 @@ class RunCommand:
     """Run the specified application and track memory usage"""
 
     def prepare_parser(self, parser: argparse.ArgumentParser) -> None:
-        parser.usage = "%(prog)s [-m module | file] [args]"
+        parser.usage = "%(prog)s [-m module | -c cmd | file] [args]"
         output_group = parser.add_mutually_exclusive_group()
         output_group.add_argument(
             "-o",
@@ -191,6 +226,12 @@ class RunCommand:
             default=None,
             type=int,
         )
+        parser.add_argument(
+            "--aggregate",
+            help="Write aggregated stats to the output file instead of all allocations",
+            action="store_true",
+            default=False,
+        )
 
         parser.add_argument(
             "--native",
@@ -206,6 +247,12 @@ class RunCommand:
             default=False,
         )
         parser.add_argument(
+            "--trace-python-allocators",
+            action="store_true",
+            help="Record allocations made by the pymalloc allocator",
+            default=False,
+        )
+        parser.add_argument(
             "-q",
             "--quiet",
             help="Don't show any tracking-specific output while running",
@@ -216,6 +263,26 @@ class RunCommand:
             "--force",
             help="If the output file already exists, overwrite it",
             action="store_true",
+            default=False,
+        )
+        compression = parser.add_mutually_exclusive_group()
+        compression.add_argument(
+            "--compress-on-exit",
+            help="Compress the resulting file using lz4 after tracking completes",
+            default=True,
+            action="store_true",
+        )
+        compression.add_argument(
+            "--no-compress",
+            help="Do not compress the resulting file using lz4",
+            default=False,
+            action="store_true",
+        )
+        parser.add_argument(
+            "-c",
+            help="Program passed in as string",
+            action="store_true",
+            dest="run_as_cmd",
             default=False,
         )
         parser.add_argument(
@@ -237,18 +304,30 @@ class RunCommand:
         if args.run_as_module:
             return
         try:
-            source = pathlib.Path(args.script).read_bytes()
+            if args.run_as_cmd:
+                source = bytes(args.script, "UTF-8")
+            else:
+                source = pathlib.Path(args.script).read_bytes()
             ast.parse(source)
         except (SyntaxError, ValueError):
             raise MemrayCommandError(
-                "Only Python files can be executed under memray", exit_code=1
+                "Only valid Python files or commands can be executed under memray",
+                exit_code=1,
             )
 
     def run(self, args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+        if args.no_compress:
+            args.compress_on_exit = False
+
         if args.live_port is not None and not args.live_remote_mode:
             parser.error("The --live-port argument requires --live-remote")
         if args.follow_fork is True and (args.live_mode or args.live_remote_mode):
             parser.error("--follow-fork cannot be used with the live TUI")
+        if args.aggregate and (args.live_mode or args.live_remote_mode):
+            parser.error("--aggregate cannot be used with the live TUI")
+        with contextlib.suppress(OSError):
+            if args.run_as_cmd and pathlib.Path(args.script).exists():
+                parser.error("remove the option -c to run a file")
 
         self.validate_target_file(args)
 

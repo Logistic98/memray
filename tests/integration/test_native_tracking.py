@@ -1,6 +1,10 @@
+import functools
+import os
 import shutil
 import subprocess
 import sys
+import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -46,7 +50,7 @@ def test_multithreaded_extension_with_native_tracking(tmpdir, monkeypatch):
     outstanding_memaligns = set()
 
     for record in records:
-        if record.allocator == AllocatorType.MEMALIGN:
+        if record.allocator == AllocatorType.POSIX_MEMALIGN:
             memaligns.append(record)
             outstanding_memaligns.add(record.address)
         elif record.allocator == AllocatorType.FREE:
@@ -56,15 +60,18 @@ def test_multithreaded_extension_with_native_tracking(tmpdir, monkeypatch):
 
     assert len(memaligns) == 100 * 100  # 100 threads allocate 100 times in testext
     assert all(len(memalign.stack_trace()) == 0 for memalign in memaligns)
-    expected_symbols = ["worker(void*)", "start_thread"]
+    expected_symbols = ["allocate_memory", "worker"]
     assert all(
         expected_symbols == [stack[0] for stack in record.native_stack_trace()][:2]
         for record in memaligns
     )
 
     assert len(memalign_frees) == 100 * 100
-    assert all(len(memalign.stack_trace()) == 0 for memalign in memalign_frees)
-    assert all(len(record.native_stack_trace()) == 0 for record in memalign_frees)
+    for record in memalign_frees:
+        with pytest.raises(NotImplementedError):
+            record.stack_trace()
+        with pytest.raises(NotImplementedError):
+            record.native_stack_trace()
 
 
 @pytest.mark.valgrind
@@ -109,6 +116,10 @@ def test_simple_call_chain_with_native_tracking(tmpdir, monkeypatch):
     assert expected_symbols == [stack[0] for stack in valloc.native_stack_trace()[:3]]
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="we cannot use debug information to resolve inline functions on macOS",
+)
 def test_inlined_call_chain_with_native_tracking(tmpdir, monkeypatch):
     # GIVEN
     output = Path(tmpdir) / "test.bin"
@@ -232,14 +243,144 @@ def test_hybrid_stack_in_pure_python(tmpdir):
         == len(valloc.stack_trace()) - 2
         == MAX_RECURSIONS
     )
-    assert (
-        len(valloc.stack_trace())
-        <= len(hybrid_stack)
-        <= len(valloc.native_stack_trace())
-    )
+    assert len(valloc.stack_trace()) <= len(hybrid_stack)
+    if sys.version_info < (3, 11):
+        # The hybrid stack can be bigger than the native stack in 3.11, because
+        # non-entry frames are present in the hybrid stack but missing in the
+        # native stack. In 3.10 and earlier, the hybrid stack can't be bigger.
+        assert len(hybrid_stack) <= len(valloc.native_stack_trace())
 
     # The hybrid stack trace must run until the latest python function seen by the tracker
     assert hybrid_stack[-1] == "test_hybrid_stack_in_pure_python"
+
+
+def test_hybrid_stack_in_pure_python_with_callbacks(tmpdir):
+    # GIVEN
+    allocator = MemoryAllocator()
+    output = Path(tmpdir) / "test.bin"
+
+    def ham():
+        spam()
+
+    def spam():
+        functools.partial(foo)()
+
+    def foo():
+        bar()
+
+    def bar():
+        baz()
+
+    def baz():
+        return allocator.valloc(1234)
+
+    funcs = ("ham", "spam", "foo", "bar", "baz")
+
+    # WHEN
+
+    with Tracker(output, native_traces=True):
+        ham()
+
+    # THEN
+    records = list(FileReader(output).get_allocation_records())
+    vallocs = [
+        record
+        for record in filter_relevant_allocations(records)
+        if record.allocator == AllocatorType.VALLOC
+    ]
+
+    assert len(vallocs) == 1
+    (valloc,) = vallocs
+
+    hybrid_stack = tuple(frame[0] for frame in valloc.hybrid_stack_trace())
+    pos = {func: hybrid_stack.index(func) for func in funcs}
+    assert pos["ham"] > pos["spam"] > pos["foo"] > pos["bar"] > pos["baz"]
+    if sys.version_info >= (3, 11) and sys.implementation.name == "cpython":
+        # Some frames should be non-entry frames, and therefore adjacent to their caller
+        assert pos["ham"] == pos["spam"] + 1
+        assert pos["spam"] > pos["foo"] + 1  # map() introduces extra frames
+        assert pos["foo"] == pos["bar"] + 1
+        assert pos["bar"] == pos["baz"] + 1
+    else:
+        # All frames are entry frames; there are C frames between any 2 Python calls
+        assert pos["ham"] > pos["spam"] + 1
+        assert pos["spam"] > pos["foo"] + 1
+        assert pos["foo"] > pos["bar"] + 1
+        assert pos["bar"] > pos["baz"] + 1
+
+    # Cython frames don't show up with their Python name, neither in the hybrid
+    # stack or the Python stack.
+    assert hybrid_stack.count("valloc") == 1
+    assert [frame[0] for frame in valloc.stack_trace()].count("valloc") == 1
+
+
+def test_hybrid_stack_of_allocations_inside_ceval(tmpdir):
+    # GIVEN
+    output = Path(tmpdir) / "test.bin"
+
+    extension_name = "native_extension"
+    extension_path = tmpdir / extension_name
+    shutil.copytree(TEST_NATIVE_EXTENSION, extension_path)
+    subprocess.run(
+        [sys.executable, str(extension_path / "setup.py"), "build_ext", "--inplace"],
+        check=True,
+        cwd=extension_path,
+        capture_output=True,
+    )
+
+    # WHEN
+    program = textwrap.dedent(
+        """
+        import functools
+        import sys
+
+        import memray
+        import native_ext
+
+
+        def foo():
+            native_ext.run_recursive(1, bar)
+
+
+        def bar(_):
+            pass
+
+
+        with memray.Tracker(sys.argv[1], native_traces=True):
+            functools.partial(foo)()
+        """
+    )
+    env = os.environ.copy()
+    env["PYTHONMALLOC"] = "malloc"
+    env["PYTHONPATH"] = str(extension_path)
+
+    # WHEN
+    subprocess.run(
+        [sys.executable, "-c", program, str(output)],
+        check=True,
+        env=env,
+    )
+
+    # THEN
+    records = list(FileReader(output).get_allocation_records())
+    found_an_interesting_stack = False
+    for record in records:
+        try:
+            stack = [frame[0] for frame in record.hybrid_stack_trace()]
+        except NotImplementedError:
+            continue  # Must be a free; we don't have its stack.
+
+        print(stack)
+
+        # This function never allocates anything, so we should never see it.
+        assert "bar" not in stack
+
+        if "run_recursive" in stack:
+            found_an_interesting_stack = True
+            # foo calls run_recursive, not the other way around.
+            assert stack.index("foo") > stack.index("run_recursive")
+
+    assert found_an_interesting_stack
 
 
 def test_hybrid_stack_in_recursive_python_c_call(tmpdir, monkeypatch):
@@ -334,6 +475,34 @@ def test_hybrid_stack_in_a_thread(tmpdir, monkeypatch):
     assert len(valloc.stack_trace()) == 0
     expected_symbols = ["baz", "bar", "foo"]
     assert expected_symbols == [stack[0] for stack in valloc.hybrid_stack_trace()][:3]
+
+
+def test_hybrid_stack_of_python_thread_starts_with_native_frames(tmp_path):
+    """Ensure there are native frames above a thread's first Python frame."""
+    # GIVEN
+    allocator = MemoryAllocator()
+    output = tmp_path / "test.bin"
+
+    def func():
+        allocator.valloc(1234)
+        allocator.free()
+
+    # WHEN
+    with Tracker(output, native_traces=True):
+        thread = threading.Thread(target=func)
+        thread.start()
+        thread.join()
+
+    # THEN
+    allocations = list(FileReader(output).get_allocation_records())
+
+    vallocs = [
+        event
+        for event in allocations
+        if event.size == 1234 and event.allocator == AllocatorType.VALLOC
+    ]
+    (valloc,) = vallocs
+    assert not valloc.hybrid_stack_trace()[-1][1].endswith(".py")
 
 
 @pytest.mark.parametrize("native_traces", [True, False])

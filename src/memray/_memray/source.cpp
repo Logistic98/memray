@@ -1,18 +1,16 @@
-#include <arpa/inet.h>
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <netdb.h>
-#include <sstream>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <thread>
-
-#include <Python.h>
 
 #include "exceptions.h"
 #include "logging.h"
@@ -25,23 +23,45 @@ namespace memray::io {
 FileSource::FileSource(const std::string& file_name)
 : d_file_name(file_name)
 {
-    d_stream.open(d_file_name, std::ios::binary | std::ios::in);
-    if (!d_stream) {
+    d_raw_stream = std::make_shared<std::ifstream>(d_file_name, std::ios::binary | std::ios::in);
+    if (!(*d_raw_stream)) {
         throw IoError{"Could not open file " + file_name + ": " + std::string(strerror(errno))};
+    }
+    char lz4_magic[] = {0x04, 0x22, 0x4D, 0x18};
+    char file_magic[sizeof(lz4_magic)] = {};
+    d_raw_stream->read(file_magic, sizeof(file_magic));
+    d_raw_stream->seekg(0, std::ios::beg);
+
+    if (0 == memcmp(lz4_magic, file_magic, sizeof(lz4_magic))) {
+        d_stream = std::make_shared<lz4_stream::istream>(*d_raw_stream);
+    } else {
+        d_stream = d_raw_stream;
+        findReadableSize();
     }
 }
 
 bool
 FileSource::read(char* stream, ssize_t length)
 {
-    return !d_stream.read(stream, length).fail();
+    if (d_stream->read(stream, length).fail()) {
+        return false;
+    }
+    d_bytes_read += length;
+    if (d_readable_size && d_bytes_read > d_readable_size) {
+        return false;
+    }
+    return true;
 }
 
 bool
 FileSource::getline(std::string& result, char delimiter)
 {
-    std::getline(d_stream, result, delimiter);
+    std::getline(*d_stream, result, delimiter);
     if (!d_stream) {
+        return false;
+    }
+    d_bytes_read += result.size() + 1;
+    if (d_readable_size && d_bytes_read > d_readable_size) {
         return false;
     }
     return true;
@@ -54,15 +74,42 @@ FileSource::close()
 }
 
 void
+FileSource::findReadableSize()
+{
+    // We grow the file in chunks and then overwrite the zero-filled data with
+    // valid data, which means that if the process is killed in the middle of
+    // tracking there will be some zero-filled bytes at the end of the file.
+    // Ignore any zeroed bytes at the end of the file, assuming they resulted
+    // from such premature termination (because when tracking ends successfully
+    // a TRAILER record is written at the end of the valid data). We may ignore
+    // some valid zero bytes that were part of a complete record, but since the
+    // record type cannot be all zeroes, we will at worst lose one valid record
+    // in order to recover from the file truncation. To ignore these, we count
+    // the zeroed bytes at the end of the file, and make calls to read() and
+    // getline() fail if they read into those bytes.
+    d_raw_stream->seekg(-1, d_raw_stream->end);
+    while (*d_raw_stream) {
+        char c = d_raw_stream->peek();
+        if (c != 0x00) {
+            d_readable_size = d_raw_stream->tellg() + std::streamoff(1);
+            break;
+        }
+        // If we're at BOF, this sets failbit and makes the loop break.
+        d_raw_stream->seekg(-1, d_raw_stream->cur);
+    }
+    d_raw_stream->seekg(0, d_raw_stream->beg);
+}
+
+void
 FileSource::_close()
 {
-    d_stream.close();
+    d_raw_stream->close();
 }
 
 bool
 FileSource::is_open()
 {
-    return d_stream.is_open();
+    return d_raw_stream->is_open();
 }
 
 FileSource::~FileSource()

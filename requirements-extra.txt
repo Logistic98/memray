@@ -1,9 +1,5 @@
-black
-flake8
-isort
 mypy
 bump2version
 towncrier
-check-manifest
-types-Jinja2
+pre-commit
 -r requirements-docs.txt

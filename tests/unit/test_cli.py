@@ -10,8 +10,10 @@ from memray import SocketDestination
 from memray.commands import main
 from memray.commands.flamegraph import FlamegraphCommand
 from memray.commands.run import RunCommand
+from memray.commands.stats import StatsCommand
 from memray.commands.summary import SummaryCommand
 from memray.commands.table import TableCommand
+from memray.commands.transform import TransformCommand
 from memray.commands.tree import TreeCommand
 
 
@@ -36,7 +38,7 @@ class TestRunSubCommand:
             main(["run"])
 
         captured = capsys.readouterr()
-        assert "usage: memray run [-m module | file] [args]" in captured.err
+        assert "usage: memray run [-m module | -c cmd | file] [args]" in captured.err
 
     def test_run_default_output(
         self, getpid_mock, runpy_mock, tracker_mock, validate_mock
@@ -62,6 +64,20 @@ class TestRunSubCommand:
         tracker_mock.assert_called_with(
             destination=FileDestination("memray-foobar.0.bin", overwrite=False),
             native_traces=True,
+        )
+
+    def test_run_with_pymalloc_tracing(
+        self, getpid_mock, runpy_mock, tracker_mock, validate_mock
+    ):
+        getpid_mock.return_value = 0
+        assert 0 == main(["run", "--trace-python-allocators", "-m", "foobar"])
+        runpy_mock.run_module.assert_called_with(
+            "foobar", run_name="__main__", alter_sys=True
+        )
+        tracker_mock.assert_called_with(
+            destination=FileDestination("memray-foobar.0.bin", overwrite=False),
+            native_traces=False,
+            trace_python_allocators=True,
         )
 
     def test_run_override_output(
@@ -93,6 +109,22 @@ class TestRunSubCommand:
         runpy_mock.run_module.assert_called_with(
             "foobar", run_name="__main__", alter_sys=True
         )
+
+    def test_run_cmd_is_validated(
+        self, getpid_mock, runpy_mock, tracker_mock, validate_mock
+    ):
+        with patch.object(RunCommand, "validate_target_file"):
+            assert 0 == main(["run", "-c", "x = [i for i in range(10)]"])
+            with pytest.raises(SyntaxError):
+                main(["run", "-c", "[i for i in range(10)"])
+
+    def test_run_cmd(self, getpid_mock, runpy_mock, tracker_mock, validate_mock):
+        with patch("memray.commands.run.exec") as mock_exec:
+            assert 0 == main(["run", "-c", "x = 10; y = abs(-10)"])
+            assert not runpy_mock.called
+            mock_exec.assert_called_with(
+                "x = 10; y = abs(-10)", {"__name__": "__main__"}
+            )
 
     def test_run_file(self, getpid_mock, runpy_mock, tracker_mock, validate_mock):
         with patch.object(RunCommand, "validate_target_file"):
@@ -136,14 +168,58 @@ class TestRunSubCommand:
                 sys.executable,
                 "-c",
                 "from memray.commands.run import _child_process;"
-                '_child_process(1234,False,False,False,"./directory/foobar.py",'
-                "['arg1', 'arg2'])",
+                "_child_process(1234,False,False,False,False,False,"
+                "'./directory/foobar.py',['arg1', 'arg2'])",
             ],
             stderr=-1,
             stdout=-3,
             text=True,
         )
-        live_command_mock().start_live_interface.assert_called_with(1234)
+        live_command_mock().start_live_interface.assert_called_with(
+            1234,
+            cmdline_override="./directory/foobar.py arg1 arg2",
+        )
+
+    @patch("memray.commands.run.subprocess.Popen")
+    @patch("memray.commands.run.LiveCommand")
+    def test_run_with_live_and_trace_python_allocators(
+        self,
+        live_command_mock,
+        popen_mock,
+        getpid_mock,
+        runpy_mock,
+        tracker_mock,
+        validate_mock,
+    ):
+        getpid_mock.return_value = 0
+        popen_mock().__enter__().returncode = 0
+        with patch("memray.commands.run._get_free_port", return_value=1234):
+            assert 0 == main(
+                [
+                    "run",
+                    "--live",
+                    "--trace-python-allocators",
+                    "./directory/foobar.py",
+                    "arg1",
+                    "arg2",
+                ]
+            )
+        popen_mock.assert_called_with(
+            [
+                sys.executable,
+                "-c",
+                "from memray.commands.run import _child_process;"
+                "_child_process(1234,False,True,False,False,False,"
+                "'./directory/foobar.py',['arg1', 'arg2'])",
+            ],
+            stderr=-1,
+            stdout=-3,
+            text=True,
+        )
+        live_command_mock().start_live_interface.assert_called_with(
+            1234,
+            cmdline_override="./directory/foobar.py arg1 arg2",
+        )
 
     def test_run_with_live_remote(
         self, getpid_mock, runpy_mock, tracker_mock, validate_mock
@@ -229,6 +305,31 @@ class TestRunSubCommand:
 
         captured = capsys.readouterr()
         assert "--follow-fork cannot be used with" in captured.err
+
+    def test_run_with_trace_python_allocators_and_live_remote_mode(
+        self, getpid_mock, runpy_mock, tracker_mock, validate_mock, capsys
+    ):
+        getpid_mock.return_value = 0
+        with patch("memray.commands.run._get_free_port", return_value=1234):
+            assert 0 == main(
+                [
+                    "run",
+                    "--live-remote",
+                    "--trace-python-allocators",
+                    "./directory/foobar.py",
+                    "arg1",
+                    "arg2",
+                ]
+            )
+        runpy_mock.run_path.assert_called_with(
+            "./directory/foobar.py",
+            run_name="__main__",
+        )
+        tracker_mock.assert_called_with(
+            destination=SocketDestination(server_port=1234, address="127.0.0.1"),
+            native_traces=False,
+            trace_python_allocators=True,
+        )
 
 
 class TestFlamegraphSubCommand:
@@ -413,7 +514,7 @@ class TestTreeSubCommand:
 
         # THEN
         assert namespace.results == "results.txt"
-        assert namespace.biggest_allocs == 10
+        assert namespace.biggest_allocs == 200
 
     def test_parser_acceps_biggest_allocs_short_form(self):
         # GIVEN
@@ -638,3 +739,183 @@ class TestSummarySubCommand:
         assert namespace.results == "results.txt"
         assert namespace.sort_column == 1
         assert namespace.max_rows == 2
+
+
+class TestStatsSubCommand:
+    @staticmethod
+    def get_prepared_parser():
+        parser = argparse.ArgumentParser()
+        command = StatsCommand()
+        command.prepare_parser(parser)
+
+        return command, parser
+
+    def test_parser_rejects_no_arguments(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN / THEN
+        with pytest.raises(SystemExit):
+            parser.parse_args([])
+
+    def test_parser_accepts_single_argument(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(["results.txt"])
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.num_largest == 5
+
+    def test_parser_accepts_valid_num_largest_allocators(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(["-n", "3", "results.txt"])
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.num_largest == 3
+
+    def test_parser_rejects_invalid_num_largest_allocators(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN / THEN
+        with pytest.raises(SystemExit):
+            parser.parse_args(["-n", "-1", "results.txt"])
+
+
+class TestTransformSubCommand:
+    @staticmethod
+    def get_prepared_parser():
+        parser = argparse.ArgumentParser()
+        command = TransformCommand()
+        command.prepare_parser(parser)
+
+        return command, parser
+
+    def test_parser_rejects_no_arguments(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN / THEN
+        with pytest.raises(SystemExit):
+            parser.parse_args([])
+
+    def test_parser_rejects_when_no_results_provided(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN / THEN
+        with pytest.raises(SystemExit):
+            parser.parse_args(["gprof2dot", "--leaks"])
+
+    def test_parser_invalid_format(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN / THEN
+        with pytest.raises(SystemExit):
+            parser.parse_args(["blech"])
+
+    def test_parser_accepts_single_argument_with_format(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(["gprof2dot", "results.txt"])
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.format == "gprof2dot"
+        assert namespace.show_memory_leaks is False
+
+    def test_parser_accepts_short_form_output_1(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(["gprof2dot", "results.txt", "-o", "output.html"])
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.output == "output.html"
+        assert namespace.show_memory_leaks is False
+        assert namespace.format == "gprof2dot"
+
+    def test_parser_accepts_short_form_output_2(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(["gprof2dot", "-o", "output.html", "results.txt"])
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.output == "output.html"
+        assert namespace.show_memory_leaks is False
+        assert namespace.format == "gprof2dot"
+
+    def test_parser_accepts_long_form_output_1(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(
+            ["gprof2dot", "results.txt", "--output", "output.html"]
+        )
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.output == "output.html"
+        assert namespace.show_memory_leaks is False
+        assert namespace.format == "gprof2dot"
+
+    def test_parser_accepts_long_form_output_2(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(
+            ["gprof2dot", "--output", "output.html", "results.txt"]
+        )
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.output == "output.html"
+        assert namespace.show_memory_leaks is False
+        assert namespace.format == "gprof2dot"
+
+    def test_parser_takes_memory_leaks_as_a_flag(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(
+            ["gprof2dot", "results.txt", "--leaks", "--output", "output.html"]
+        )
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.output == "output.html"
+        assert namespace.show_memory_leaks is True
+        assert namespace.format == "gprof2dot"
+
+    def test_parser_takes_force_flag(self):
+        # GIVEN
+        _, parser = self.get_prepared_parser()
+
+        # WHEN
+        namespace = parser.parse_args(
+            ["gprof2dot", "results.txt", "--force", "--output", "output.html"]
+        )
+
+        # THEN
+        assert namespace.results == "results.txt"
+        assert namespace.output == "output.html"
+        assert namespace.force is True
+        assert namespace.format == "gprof2dot"

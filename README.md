@@ -4,13 +4,15 @@
 
 ---
 
-![OS Linux](https://img.shields.io/badge/OS-Linux-blue)
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/memray)
-![PyPI - Implementation](https://img.shields.io/pypi/implementation/memray)
-![PyPI](https://img.shields.io/pypi/v/memray)
-![PyPI - Downloads](https://img.shields.io/pypi/dm/memray)
+[![OS Linux](https://img.shields.io/badge/OS-Linux-blue)](https://pypi.org/project/memray)
+[![OS MacOS](https://img.shields.io/badge/OS-macOS-blue)](https://pypi.org/project/memray)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/memray)](https://pypi.org/project/memray)
+[![PyPI - Implementation](https://img.shields.io/pypi/implementation/memray)](https://pypi.org/project/memray)
+[![PyPI](https://img.shields.io/pypi/v/memray)](https://pypi.org/project/memray)
+[![PyPI - Downloads](https://img.shields.io/pypi/dm/memray)](https://pypistats.org/packages/memray)
+[![Conda Version](https://img.shields.io/conda/vn/conda-forge/memray.svg)](https://anaconda.org/conda-forge/memray)
 [![Tests](https://github.com/bloomberg/memray/actions/workflows/build.yml/badge.svg)](https://github.com/bloomberg/memray/actions/workflows/build.yml)
-![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 <p align="center"><img src="https://raw.githubusercontent.com/bloomberg/memray/main/docs/_static/images/output.png" alt="Memray output"></p>
 
@@ -35,7 +37,24 @@ Memray can help with the following problems:
 - Find memory leaks.
 - Find hotspots in code that cause a lot of allocations.
 
-Note that Memray only works on Linux and cannot be installed on other platforms.
+> **Note**
+> Memray only works on Linux and MacOS, and cannot be installed on other platforms.
+
+<p align="center">
+<img src="https://raw.githubusercontent.com/bloomberg/memray/main/docs/_static/images/quotes.png" width="100%">
+</p>
+
+# Help us improve Memray!
+
+We are constantly looking for feedback from our awesome community ❤️. If you
+have used Memray to solve a problem, profile an application, find a memory leak
+or anything else, please let us know! We would love to hear about your
+experience and how Memray helped you.
+
+Please, consider writing your story in the [Success
+Stories discussion page](https://github.com/bloomberg/memray/discussions/226).
+
+It really makes a difference!
 
 # Installation
 
@@ -49,16 +68,33 @@ packaging tools. We recommend installing the latest stable release from
 
 Notice that Memray contains a C extension so releases are distributed as binary
 wheels as well as the source code. If a binary wheel is not available for your system
-(Linux x86/x64), you'll need to ensure that all the dependencies are satisfied on the
+(Linux x86/x64 or macOS), you'll need to ensure that all the dependencies are satisfied on the
 system where you are doing the installation.
 
 ## Building from source
 
 If you wish to build Memray from source you need the following binary dependencies in your system:
 
-- libunwind
+- libdebuginfod-dev (for Linux)
+- libunwind (for Linux)
+- liblz4
 
-Check your package manager on how to install these dependencies (for example `apt-get install libunwind-dev` in Debian-based systems).
+Check your package manager on how to install these dependencies (for example `apt-get install build-essential python3-dev libdebuginfod-dev libunwind-dev liblz4-dev` in Debian-based systems
+or `brew install lz4` in MacOS). Note that you may need to teach the compiler where to find the header and library files of the dependencies. For
+example, in MacOS with `brew` you may need to run:
+
+```shell
+export CFLAGS="-I$(brew --prefix lz4)/include" LDFLAGS="-L$(brew --prefix lz4)/lib -Wl,-rpath,$(brew --prefix lz4)/lib"
+```
+
+before installing `memray`. Check the documentation of your package manager to know the location of the header and library
+files for more detailed information.
+
+If you are building on MacOS, you will also need to set the deployment target.
+
+```shell
+export MACOSX_DEPLOYMENT_TARGET=10.14
+```
 
 Once you have the binary dependencies installed, you can clone the repository and follow with the normal building process:
 
@@ -72,6 +108,14 @@ python3 -m pip install -e . -r requirements-test.txt -r requirements-extra.txt
 ```
 
 This will install Memray in the virtual environment in development mode (the `-e` of the last `pip install` command).
+
+If you plan to contribute back, you should install the pre-commit hooks:
+
+```shell
+pre-commit install
+```
+
+This will ensure that your contribution passes our linting checks.
 
 # Documentation
 
@@ -109,11 +153,12 @@ positional arguments:
 optional arguments:
   -h, --help            Show this help message and exit
   -v, --verbose         Increase verbosity. Option is additive and can be specified up to 3 times
+  -V, --version         Displays the current version of Memray
 
 Please submit feedback, ideas, and bug reports by filing a new issue at https://github.com/bloomberg/memray/issues
 ```
 
-To use Memray over a script or a single python file you can use
+To use Memray over a script or a single python file you can use:
 
 ```shell
 python3 -m memray run my_script.py
@@ -186,7 +231,7 @@ def test_foobar():
     # do some stuff that allocates memory
 ```
 
-To learn more on how the plugin can be used and configured check out [the plugin documentation](https://bloomberg.github.io/pytest-memray/#).
+To learn more on how the plugin can be used and configured check out [the plugin documentation](https://pytest-memray.readthedocs.io).
 
 # Native mode
 
@@ -210,7 +255,7 @@ Reporters display native frames in a different color than Python frames. They ca
 
 # Live mode
 
-<p align="center"><img src="https://raw.githubusercontent.com/bloomberg/memray/main/docs/_static/images/live_animated.gif" alt="Memray output"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/bloomberg/memray/main/docs/_static/images/live_animated.webp" alt="Memray output"></p>
 
 Memray's live mode runs a script or a module in a terminal-based interface that allows you to interactively inspect its memory usage while it runs. This is useful for debugging scripts or modules that take a long time to run or that exhibit multiple complex memory patterns. You can use the `--live` option to run the script or module in live mode:
 
@@ -238,11 +283,13 @@ The results are displayed in descending order of total memory allocated by a fun
 
 - a: Sort by allocation count
 
-The sorted column is highlighted with `< >` characters around the title.
+In most terminals you can also click the "Sort by Total", "Sort by Own", and "Sort by Allocations" buttons on the footer.
+
+The sorted column's heading is underlined.
 
 ## Viewing different threads
 
-By default, the live command will present the main thread of the program. You can look at different threads of the program by pressing the left and right arrow keys.
+By default, the live command will present the main thread of the program. You can look at different threads of the program by pressing the greater than and less than keys, `<` and `>`. In most terminals you can also click the "Previous Thread" and "Next Thread" buttons on the footer.
 
 <img src="https://github.com/bloomberg/memray/blob/main/docs/_static/images/live_different_thread.png?raw=true" align="center"/>
 
@@ -285,12 +332,12 @@ Below you will find some basic steps required to be able to contribute to the pr
 
 ## Contribution Licensing
 
-Since this project is distributed under the terms of an [open source license](LICENSE), contributions that you make
-are licensed under the same terms. In order for us to be able to accept your contributions,
+Since this project is distributed under the terms of an [open source license](LICENSE), contributions that
+you make are licensed under the same terms. In order for us to be able to accept your contributions,
 we will need explicit confirmation from you that you are able and willing to provide them under
 these terms, and the mechanism we use to do this is called a Developer's Certificate of Origin
-[(DCO)](https://github.com/bloomberg/.github/blob/main/DCO.md). This is very similar to the process used by the Linux(R) kernel, Samba, and many
-other major open source projects.
+[(DCO)](https://github.com/bloomberg/.github/blob/main/DCO.md). This is very similar to the process
+used by the Linux kernel, Samba, and many other major open source projects.
 
 To participate under these terms, all that you must do is include a line like the following as the
 last line of the commit message for each commit in your contribution:

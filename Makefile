@@ -1,26 +1,21 @@
 PYTHON ?= python
 NPM ?= npm
 CLANG_FORMAT ?= clang-format
-PRETTIER ?= prettier --no-editorconfig
 
 # Doc generation variables
 UPSTREAM_GIT_REMOTE ?= origin
 DOCSBUILDDIR := docs/_build
 HTMLDIR := $(DOCSBUILDDIR)/html
-PKG_CONFIG_PATH ?= /opt/bb/lib64/pkgconfig
-PIP_INSTALL=PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" $(PYTHON) -m pip install
+PIP_INSTALL=$(PYTHON) -m pip install
 
 reporters_path := ./src/memray/reporters
 js_files := $(wildcard $(reporters_path)/assets/*.js)
 generated_js_files := \
+    $(reporters_path)/templates/assets/flamegraph_common.js \
     $(reporters_path)/templates/assets/flamegraph.js \
+    $(reporters_path)/templates/assets/temporal_flamegraph.js \
     $(reporters_path)/templates/assets/table.js
-css_files := 'src/**/*.css'
-markdown_files := $(shell find . -name \*.md -not -path '*/\.*' -not -path './src/vendor/*')
 cpp_files := $(shell find src/memray/_memray -name \*.cpp -o -name \*.h)
-python_files := $(shell find . -name \*.py -not -path '*/\.*')
-cython_files := $(shell find src -name \*.pyx -or -name \*.pxd -not -path '*/\.*')
-type_files := $(shell find src -name \*.pyi -not -path '*/\.*')
 
 # Use this to inject arbitrary commands before the make targets (e.g. docker)
 ENV :=
@@ -65,6 +60,7 @@ check-python:
 
 .PHONY: check-js  ## Run the Javascript tests
 check-js:
+	$(NPM) install jest --save-dev
 	$(NPM) run-script test
 
 .PHONY: pycoverage
@@ -76,11 +72,15 @@ pycoverage:  ## Run the test suite, with Python code coverage
 		--color=yes \
 		--cov=memray \
 		--cov=tests \
-		--cov-config=tox.ini \
+		--cov-config=pyproject.toml \
 		--cov-report=term \
-		--cov-fail-under=80 \
+		--cov-fail-under=90 \
 		--cov-append $(PYTEST_ARGS) \
 		tests
+	$(PYTHON) -m coverage lcov -i -o pycoverage.lcov
+	if [ -z "$$SKIP_COVERAGE_HTML" ]; then \
+		genhtml *coverage.lcov  --branch-coverage --output-directory memray-coverage $(GENHTMLOPTS); \
+	fi
 
 .PHONY: valgrind
 valgrind:  ## Run valgrind, with the correct configuration
@@ -107,55 +107,26 @@ ccoverage:  ## Run the test suite, with C++ code coverage
 	CFLAGS="$(CFLAGS) -O0 -pg --coverage" $(MAKE) build
 	$(MAKE) check
 	gcov -i build/*/src/memray/_memray -i -d
-	lcov --capture --directory .  --output-file memray.info
-	lcov --extract memray.info '*/src/memray/*' --output-file memray.info
-	genhtml memray.info --output-directory memray-coverage
+	lcov --capture --directory .  --output-file cppcoverage.lcov
+	lcov --extract cppcoverage.lcov '*/src/memray/_memray/*' --output-file cppcoverage.lcov
+	genhtml *coverage.lcov --branch-coverage --output-directory memray-coverage
 	find . | grep -E '(\.gcda|\.gcno|\.gcov\.json\.gz)' | xargs rm -rf
 
-.PHONY: format-python
-format-python:  ## Autoformat Python files
-	$(PYTHON) -m isort $(python_files) $(cython_files) $(type_files)
-	$(PYTHON) -m black $(python_files)
-	$(PYTHON) -m black $(type_files)
-
-.PHONY: format-markdown
-format-markdown:  ## Autoformat markdown files
-	$(PRETTIER) --write $(markdown_files)
-
-.PHONY: format-assets
-format-assets:  ## Autoformat CSS and JS files
-	$(PRETTIER) --write $(js_files) $(css_files)
-
 .PHONY: format
-format: format-python format-markdown format-assets  ## Autoformat all files
-	$(CLANG_FORMAT) -i $(cpp_files)
-
-.PHONY: lint-python
-lint-python:  ## Lint Python files
-	$(PYTHON) -m isort --check $(python_files) $(cython_files) $(type_files)
-	$(PYTHON) -m flake8 $(python_files)
-	$(PYTHON) -m black --check $(python_files)
-	$(PYTHON) -m black --check $(type_files)
-	$(PYTHON) -m mypy -p memray --strict --ignore-missing-imports
-	$(PYTHON) -m mypy tests --ignore-missing-imports
-
-.PHONY: lint-markdown
-lint-markdown:  ## Lint markdown files
-	$(PRETTIER) --check $(markdown_files)
-
-.PHONY: lint-assets
-lint-assets:  ## Lint CSS and JS files
-	$(PRETTIER) --check $(js_files) $(css_files)
+format:  ## Autoformat all files
+	$(PYTHON) -m pre_commit run --all-files
 
 .PHONY: lint
-lint: lint-python lint-markdown lint-assets  ## Lint all files
-	$(CLANG_FORMAT) --Werror --dry-run $(cpp_files)
-	$(PYTHON) -m check_manifest
+lint:  ## Lint all files
+	$(PYTHON) -m pre_commit run --all-files
+	$(PYTHON) -m mypy -p memray --strict --ignore-missing-imports
+	$(PYTHON) -m mypy tests --ignore-missing-imports
 
 .PHONY: docs
 docs:  ## Generate documentation
 	$(MAKE) -C docs clean
 	$(MAKE) -C docs html
+	$(MAKE) -C docs man
 
 .PHONY: docs-live
 docs-live:  ## Serve documentation on localhost:8000, with live-reload
@@ -163,7 +134,7 @@ docs-live:  ## Serve documentation on localhost:8000, with live-reload
 	$(MAKE) -C docs livehtml
 
 .PHONY: gh-pages
-gh-pages:  ## Publish documentation on BBGitHub Pages
+gh-pages:  ## Publish documentation on GitHub Pages
 	$(eval GIT_REMOTE := $(shell git remote get-url $(UPSTREAM_GIT_REMOTE)))
 	$(eval COMMIT_HASH := $(shell git rev-parse HEAD))
 	touch $(HTMLDIR)/.nojekyll
@@ -177,12 +148,16 @@ gh-pages:  ## Publish documentation on BBGitHub Pages
 
 .PHONY: clean
 clean:  ## Clean any built/generated artifacts
-	find . | grep -E '(\.o|\.so|\.gcda|\.gcno|\.gcov\.json\.gz)' | xargs rm -rf
+	find . | grep -E '(\.o|\.gcda|\.gcno|\.gcov\.json\.gz)' | xargs rm -rf
 	find . | grep -E '(__pycache__|\.pyc|\.pyo)' | xargs rm -rf
+	rm -rf build
+	rm -f src/memray/_test_utils.*.so
+	rm -f src/memray/_memray.*.so
+	rm -f src/memray/_inject.*.so
 	rm -f src/memray/_memray.cpp
-	rm -f memray.info
 	rm -rf memray-coverage
 	rm -rf node_modules
+	rm -f cppcoverage.lcov
 
 .PHONY: bump_version
 bump_version:

@@ -2,9 +2,7 @@ Stats Reporter
 ==============
 
 The stats reporter generates high level statistics about the tracked process's
-memory allocations. By default, it computes these statistics for the moment when
-the tracked process's memory usage was at its peak, but it can optionally
-compute the stats for *all* allocations instead.
+memory allocations.
 
 .. image:: _static/images/stats_example.png
 
@@ -22,12 +20,7 @@ The output includes the following:
 
 * Stack trace and **count** of the top 'n' largest allocating locations by number of allocations (*default: 5*, configurable with the ``-n`` command line param)
 
-.. note::
-
-    By default, the statistics are displayed only for the time when the memory
-    usage was at its peak. However, it is possible to use the ``-a`` command
-    line argument to consider all allocations throughout the life of the
-    process. Including all allocations slows this reporter down drastically.
+* (for JSON output only) Metadata about the tracked process
 
 Basic Usage
 -----------
@@ -38,11 +31,23 @@ The general form of the ``stats`` subcommand is:
 
     memray stats [options] <results>
 
-The only argument the ``tree`` subcommand requires is the capture file
+The only argument the ``stats`` subcommand requires is the capture file
 previously generated using :doc:`the run subcommand <run>`.
 
 The output will be printed directly to the standard output of the terminal.
 
+JSON Output
+-----------
+
+If you supply the ``--json`` flag, the ``stats`` subcommand will write its
+output to a JSON file, rather than to the terminal. Like other commands that
+output to files, the default output file name is based on the name of your
+capture file, but it can be overridden with the ``-o`` / ``--output`` option.
+By default Memray will refuse to overwrite an existing file, but you can force
+it to by supplying the ``-f`` / ``--force`` option.
+
+Note that new fields may be added to the JSON output over time, though we'll
+try to avoid removing existing fields.
 
 CLI Reference
 -------------

@@ -51,15 +51,30 @@ it. You can change the ordering with the following keyboard shortcuts:
 - o: Sort by own memory
 - a: Sort by allocation count
 
-The sorted column is highlighted with ``< >`` characters around the title.
+In most terminals you can also click the "Sort by Total", "Sort by Own", and "Sort by Allocations" buttons on the
+footer.
+
+The sorted column's heading is underlined.
 
 Viewing different threads
 -------------------------
 
-By default, the ``live`` command will present the main thread of the program. You can look at different threads of the
-program by pressing the left and right arrow keys.
+By default, the ``live`` command will present allocations from all of the program's threads. You can look at individual
+threads of the program by first pressing ``m`` (to disable thread merging), and then pressing the greater than and less
+than keys, ``<`` and ``>``, to switch between threads. In most terminals you can also click the "Unmerge Threads",
+"Previous Thread", and "Next Thread" buttons on the footer.
 
 .. image:: _static/images/live_different_thread.png
+
+Using with native tracking
+--------------------------
+
+It is possible to use :ref:`native tracking` along with the live mode. This can be achieved by passing ``--native``
+to the ``run`` command.
+
+.. code:: shell-session
+
+  $ memray run --live --native application.py
 
 Remote mode
 -----------
@@ -73,7 +88,7 @@ specify the program to be profiled in live mode using ``run --live-remote``:
   Run 'memray live <port>' in another shell to see live results
 
 As you can see, Memray is now waiting on a connection to the live tracking server. You can now attach to
-the server using running the ``live`` command in a separate shell.  
+the server using running the ``live`` command in a separate shell.
 
 .. code:: shell-session
 
@@ -104,21 +119,10 @@ It is possible to make ``run --live-remote`` start the server on a user-specifie
   ``run`` command *before* your script/module. Otherwise, they will be treated as arguments for the script and will not
   be used by Memray.
 
-  For example, the following invocation will pass ``--live-remote`` and ``--live-port 12345`` to ``application.py``,
-  instead of having them be used by ``memray run``:
+  For example, the following invocation will pass ``--live-port 12345`` to ``application.py``,
+  instead of having it be used by ``memray run``:
 
   .. code:: shell-session
 
     $ memray run --live-remote application.py --live-port 12345
     Run 'memray live 60125' in another shell to see live results
-
-Using with native tracking
---------------------------
-
-It is possible to use :ref:`native tracking` along with the live mode. This can be achieved by passing ``--native``
-to the ``run`` command.
-
-.. code:: shell-session
-
-  $ memray run --live --native application.py
-  Run 'memray live 60125' in another shell to see live results
